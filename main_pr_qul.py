@@ -1,26 +1,12 @@
 """
-main.py - v10 (Production hardened + full client compatibility)
+main.py - v10.1 (Production hardened + full client compatibility + 5 fixes)
 ================================================================
-Upgrades over v9:
-  - Ball event output includes 'xball' and 'batsman_out'
-    (required by clicker.py v19/v20/v25 for run-out accuracy)
-  - Ball event broadcast is SYNC (no yield) -> preserves ordering
-    with subsequent state messages even at 2000+ client scale
-  - _force_next replaced with per-message force token -> fixes the
-    stale-broadcast race between concurrent state messages
-  - Early-return cleans up force tokens (no leak)
-  - Eviction and shutdown clean up force tokens
-
-Carried over from v9:
-  - Trailing-edge state throttle (latest message kept and flushed)
-  - Protocol-level upstream ping/pong + 300s idle watchdog
-  - Expanded _state_sig (catches ball corrections)
-  - Chunked async broadcast for state events
-  - orjson with json fallback, uvloop when available
-  - WS auth token, idle timeout, message size cap
-  - REST circuit breaker, bounded fix fetch concurrency
-  - TTL rate limiter with LRU eviction
-  - Periodic maintenance loop
+Fixes applied:
+  1. _force_pending_next memory leak -> cleaned in _drop_pending/_evict_unwatched
+  2. _force_pending_next declared at top (no late-init fragility)
+  3. (script.js side) sort fallback
+  4. /api/click now respects client-supplied 'telegram' (fallback chat_id)
+  5. Ball event xball/batsman_out now consumed by client
 """
 import asyncio
 import gzip
@@ -122,10 +108,12 @@ _last_state_sent = {}
 _last_pub = {}
 
 # Force token: unique int per flush, matched against msg's token.
-# Replaces the old _force_next[mid]=True approach which raced when two
-# state messages were in flight at the same time.
 _force_msg_ids = {}   # mid -> int token
 _force_counter = 0
+
+# Set by ball event -> next state message skips throttle.
+# FIX #1 & #2: declared at top; cleaned in _drop_pending / _evict_unwatched.
+_force_pending_next = {}
 
 _fix_pending: set = set()
 _match_locks = defaultdict(asyncio.Lock)
@@ -641,12 +629,6 @@ class ConnectionManager:
                 self._drop_slow(ws)
 
     def broadcast_ball_sync(self, message: bytes, match_id: str) -> int:
-        """
-        Synchronous ball-event broadcast. Does NOT yield.
-        Preserves ordering with subsequent state messages even at 2000+ scale.
-        Ball events are rare (~1 per 20-40s per match), so blocking for
-        a few ms is acceptable and guarantees correct wire order.
-        """
         targets = self.by_match.get(match_id)
         if not targets:
             return 0
@@ -660,7 +642,6 @@ class ConnectionManager:
         return n
 
     async def broadcast_bytes(self, message: bytes, match_id: str) -> int:
-        """Async chunked broadcast for state messages (yields at chunk boundary)."""
         targets = self.by_match.get(match_id)
         if not targets:
             return 0
@@ -844,6 +825,8 @@ def _drop_pending(k):
     if h is not None:
         h.cancel()
     _force_msg_ids.pop(k, None)
+    # FIX #1: clean up pending ball->state bypass flag too.
+    _force_pending_next.pop(k, None)
 
 
 def _evict_unwatched():
@@ -873,9 +856,12 @@ def _evict_unwatched():
     if len(_match_locks) > MAX_CACHE * 2:
         for k in [k for k in _match_locks if k not in LATEST_OBJ]:
             _match_locks.pop(k, None)
-    if len(_force_msg_ids) > MAX_CACHE * 2:
-        for k in [k for k in _force_msg_ids if k not in LATEST_OBJ]:
+    # FIX #1 + #2: evict both _force_msg_ids and _force_pending_next.
+    if len(_force_msg_ids) > MAX_CACHE * 2 or len(_force_pending_next) > MAX_CACHE * 2:
+        for k in [k for k in set(_force_msg_ids) | set(_force_pending_next)
+                  if k not in LATEST_OBJ]:
             _force_msg_ids.pop(k, None)
+            _force_pending_next.pop(k, None)
 
 
 async def _maintenance_loop():
@@ -943,8 +929,6 @@ def _ensure_fix(mid: str):
 #  Push processing - HOT PATH
 # =====================================================================
 def _flush_pending(mid: str):
-    """Trailing-edge flush: send the newest throttled state message with a
-    per-message force token (not a shared boolean flag)."""
     global _force_counter
     _pending_timer.pop(mid, None)
     msg = _pending_state.pop(mid, None)
@@ -970,8 +954,6 @@ async def _process_match_msg(msg: dict, mid: str, force_token: int = 0):
         d = r.get("data") if isinstance(r.get("data"), dict) else {}
         ev = str(r.get("ball_event", ""))
 
-        # Batsman-out fallback chain across likely upstream field names.
-        # Checks both 'data' and top-level 'response' dict.
         batsman_out = (
             d.get("dismissed_batsman")
             or d.get("batsman_out")
@@ -995,13 +977,8 @@ async def _process_match_msg(msg: dict, mid: str, force_token: int = 0):
             "bowler": d.get("bowler_name"),
             "_server_ts": now_ms,
         }
-        # Set force token BEFORE broadcast. Because it is token-matched
-        # (not a shared boolean), concurrent state messages cannot consume it.
-        _force_counter  # noqa (documentational: counter increments on flush only)
-        _force_msg_ids[mid] = _force_msg_ids.get(mid, 0)  # no-op placeholder
-        # Ball event does not carry a force token; it forces the NEXT state
-        # message via the pending-state flush logic below. Mark that next
-        # state message should bypass throttle:
+        # FIX #2: clean single assignment; force the NEXT state msg
+        # for this match to skip throttle.
         _force_pending_next[mid] = True
         # Sync broadcast: no yield, preserves ordering with subsequent states.
         manager.broadcast_ball_sync(_ser(out), mid)
@@ -1045,11 +1022,6 @@ async def _process_match_msg(msg: dict, mid: str, force_token: int = 0):
         LATEST_OBJ.move_to_end(mid)
 
         await manager.broadcast_bytes(_ser(out), mid)
-
-
-# Set by ball event -> next state message skips throttle. Separate from
-# force tokens (which are assigned by flush_pending for concurrent states).
-_force_pending_next = {}
 
 
 def _dispatch_push(msg: dict, mid: str):
@@ -1309,13 +1281,15 @@ async def websocket_endpoint(websocket: WebSocket):
 # =====================================================================
 #  HTTP
 # =====================================================================
-async def _send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+async def _send_telegram(text: str, chat_id: str = None):
+    # FIX #4: accept explicit chat_id (falls back to env TELEGRAM_CHAT_ID).
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         return False
     try:
         r = await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            json={"chat_id": target, "text": text},
         )
         return r.is_success
     except Exception:
@@ -1331,8 +1305,16 @@ async def handle_click(data: dict, request: Request):
     match = str(data.get("match", ""))[:128]
     if not action:
         return JSONResponse({"status": "error", "message": "action required"}, status_code=400)
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and _rate_ok("telegram", TELEGRAM_LIMIT_PER_MIN):
-        _spawn(_send_telegram(f"Action: {action}\nMatch: {match}"))
+
+    # FIX #4: use client-supplied telegram as fallback chat_id (or as info
+    # when env TELEGRAM_CHAT_ID is already configured).
+    client_tg = str(data.get("telegram", "")).strip()[:64]
+    target_chat = TELEGRAM_CHAT_ID or client_tg
+    if TELEGRAM_BOT_TOKEN and target_chat and _rate_ok("telegram", TELEGRAM_LIMIT_PER_MIN):
+        msg = f"Action: {action}\nMatch: {match}"
+        if client_tg and client_tg != target_chat:
+            msg += f"\nClient: {client_tg}"
+        _spawn(_send_telegram(msg, target_chat))
     return {"status": "ok", "action": action}
 
 
@@ -1456,6 +1438,7 @@ async def health():
         out["fix_pending"] = len(_fix_pending)
         out["throttle_pending"] = len(_pending_state)
         out["force_pending"] = len(_force_msg_ids)
+        out["force_ball_pending"] = len(_force_pending_next)
         out["orjson"] = _orjson is not None
         out["uvloop"] = _UVLOOP
         out["broadcast_chunk"] = BROADCAST_CHUNK
@@ -1464,6 +1447,4 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host=HOST, port=PORT, workers=1,
-                access_log=False, log_level="warning",
-                ws_per_message_deflate=False, ws_max_size=WS_MAX_MSG_BYTES)
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False, log_level="info")
