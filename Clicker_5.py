@@ -1,19 +1,13 @@
 """
-clicker.py — v12.1 FIXED
-=========================
+clicker.py — v12.1 FIXED (no image save)
+========================================
 v12 + fixes:
   1. ⭐ Double-click fix: same (over, delivery) = 1 click only
   2. ⭐ Dot/wicket (run=0) → ONLY under 0.5, NO fallback
   3. ⭐ run>=1 → highest mapped over line < run
   4. ⭐ Faster cache: CACHE_FRESH_SEC=0.15, IDLE_REFRESH_SEC=0.1
   5. ⭐ Exact panel match only — no want+1, no rollover
-
-Guarantee:
-  • ১ ball = ১ click (multiple events → skip after 1st)
-  • Dot/wicket → শুধু under 0.5
-  • 1,2 → over 0.5/1.5
-  • 4,6 → over 3.5
-  • Panel == want → click, নাহলে skip
+  6. ⭐ No image save (no ocr_success.png / ocr_fail_N.png)
 
 Env:
   CLICKER_HEADLESS    1 = headless (default 0)
@@ -49,11 +43,11 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# ── Timing (⭐ faster for lower miss rate) ──
-CACHE_FRESH_SEC = 0.15        # was 0.5 — faster expiry
-IDLE_REFRESH_SEC = 0.1        # was 0.3 — faster refresh
-ANCHOR_TRUST_SEC = 300        # 5 min
-EVENT_TIMEOUT_SEC = 0.1       # was 0.2
+# ── Timing ──
+CACHE_FRESH_SEC = 0.15
+IDLE_REFRESH_SEC = 0.1
+ANCHOR_TRUST_SEC = 300
+EVENT_TIMEOUT_SEC = 0.1
 
 # ── OCR ──
 COMPARE_THRESHOLD = 0.70
@@ -87,8 +81,7 @@ panel_cache = {
     "over": None, "del": None, "ts": 0.0, "ax": None, "ay": None,
 }
 
-# ⭐ Prevent multiple clicks per ball position
-_last_clicked_want = None   # (over, del) already clicked
+_last_clicked_want = None
 
 WS_STATE = {"match_filter": "", "up": False, "msg_count": 0, "last_ts": 0.0}
 event_q = queue.SimpleQueue()
@@ -100,6 +93,7 @@ INTERMEDIATE_PATTERNS = [
     r'^(confirm(ing)?|checking)', r'^(review|drs)',
     r'^(batsman|bowler|new ?batter|misfield|dropped|overthrow)',
 ]
+
 
 # ══════════════════════════════════════════════════════════════
 #  UTIL
@@ -248,7 +242,7 @@ def setup_from_done(page, final_targets):
 
 
 # ══════════════════════════════════════════════════════════════
-#  DECIDE TARGET (⭐ strict — no fallback for run=0)
+#  DECIDE TARGET
 # ══════════════════════════════════════════════════════════════
 def _has_mapped(side, line):
     return any(t["side"] == side and abs(t["line"] - line) < 0.01
@@ -261,27 +255,14 @@ def find_target(side, line):
     return None
 
 def decide_side_line(run, kind):
-    """
-    ⭐ Strict — exactly ONE button per ball result.
-    
-    run=0 (dot/wicket/0): ONLY under 0.5. No fallback. Skip if 0.5 not mapped.
-    run>=1: Highest mapped OVER line < run.
-            Skip if no over line < run mapped.
-    
-    Returns (side, line) or (None, None) to skip.
-    """
-    # ═══ run=0: ONLY under 0.5 ═══
     if run == 0:
         if _has_mapped("under", 0.5):
             return ("under", 0.5)
-        return (None, None)   # no fallback, skip
-
-    # ═══ run>=1: highest mapped OVER < run ═══
+        return (None, None)
     for ln in [7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5]:
         if ln < run and _has_mapped("over", ln):
             return ("over", ln)
-
-    return (None, None)   # no over line fits → skip
+    return (None, None)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -310,7 +291,6 @@ def find_anchor_fast(page):
                         return ax, ay
             except Exception:
                 pass
-    # Full re-scan
     try:
         raw = page.screenshot(type="png", scale="css")
         src_img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -327,9 +307,9 @@ def find_anchor_fast(page):
 
 
 # ══════════════════════════════════════════════════════════════
-#  OCR
+#  OCR (no image save)
 # ══════════════════════════════════════════════════════════════
-_OCR_DIAG = {"fail_count": 0, "success_saved": False}
+_OCR_DIAG = {"fail_count": 0}
 
 
 def preprocess_ocr(crop):
@@ -359,19 +339,15 @@ def refresh_panel_header(page, ax, ay, probe_x, probe_y, probe_h):
             if text:
                 break
 
+        # ⭐ Only log first 5 failures — NO image save
         if not text and _OCR_DIAG["fail_count"] < 5:
             _OCR_DIAG["fail_count"] += 1
             n = _OCR_DIAG["fail_count"]
             log(f"   [OCR-DIAG #{n}] clip=({probe_x},{probe_y},w={HEADER_CROP_W}) text=''")
-            try:
-                cv2.imwrite(f"ocr_fail_{n}.png", crop_big)
-            except Exception:
-                pass
 
         if not text:
             return False
 
-        # Flexible regex
         m = (re.search(r'(\d+)\D{0,4}over\D{0,8}(\d+)\D{0,4}del', text) or
              re.search(r'(\d+)\D{0,4}over\D{0,8}(\d+)\D{0,4}de[l1]', text) or
              re.search(r'(\d+)\D{0,4}ov[er]{1,2}\D{0,8}(\d+)\D{0,4}d[e1]', text))
@@ -384,14 +360,6 @@ def refresh_panel_header(page, ax, ay, probe_x, probe_y, probe_h):
         pd = int(m.group(2))
         if not (0 <= po <= 50 and 1 <= pd <= 50):
             return False
-
-        if not _OCR_DIAG["success_saved"]:
-            try:
-                cv2.imwrite("ocr_success.png", crop_big)
-                log(f"   🎉 [OCR-FIRST-SUCCESS] panel={po}-{pd} → ocr_success.png")
-                _OCR_DIAG["success_saved"] = True
-            except Exception:
-                pass
 
         old = (panel_cache["over"], panel_cache["del"])
         panel_cache["over"] = po
@@ -420,7 +388,7 @@ def do_click(page, target_box, ax, ay):
 
 
 # ══════════════════════════════════════════════════════════════
-#  WANT COMPUTE (exact only)
+#  WANT COMPUTE
 # ══════════════════════════════════════════════════════════════
 def parse_over_ball(d):
     ov = d.get("over")
@@ -456,12 +424,11 @@ def parse_over_ball(d):
 
 
 def compute_want(over_num, ball, xball):
-    """Exact panel target: (over_num+1, ball/xball). No +1, no rollover."""
     return (over_num + 1, xball if xball is not None else ball)
 
 
 # ══════════════════════════════════════════════════════════════
-#  FASTEST + ACCURATE PROCESS (⭐ dedup fix)
+#  PROCESS EVENT
 # ══════════════════════════════════════════════════════════════
 def process_event(page, ball_key, run, kind, over_num, ball, xball):
     global _last_clicked_want
@@ -470,7 +437,6 @@ def process_event(page, ball_key, run, kind, over_num, ball, xball):
     want_over, want_del = compute_want(over_num, ball, xball)
     side_want, line_want = decide_side_line(run, kind)
 
-    # ═══ DEDUP: same (over, delivery) = same ball = skip ═══
     if _last_clicked_want == (want_over, want_del):
         log(f"⏭️ [ALREADY-CLICKED] want={want_over}-{want_del} "
             f"(ev={ball_key}) — same ball already clicked")
@@ -479,7 +445,6 @@ def process_event(page, ball_key, run, kind, over_num, ball, xball):
     log(f"🎯 [TARGET] {ball_key} run={run}({kind}) → "
         f"{side_want} {line_want} | want={want_over}-{want_del}")
 
-    # ═══ NO MAPPED LINE ═══
     if side_want is None:
         log(f"❌ [NO-MAPPED-LINE] run={run} — skipping (no exact button)")
         return False
@@ -489,7 +454,6 @@ def process_event(page, ball_key, run, kind, over_num, ball, xball):
         log(f"❌ [NO-TARGET] {side_want} {line_want}")
         return False
 
-    # ═══ FAST PATH: cache hit → 10ms click ═══
     cache_age = time.time() - panel_cache["ts"]
     if (cache_age < CACHE_FRESH_SEC and
         panel_cache["over"] == want_over and
@@ -499,11 +463,10 @@ def process_event(page, ball_key, run, kind, over_num, ball, xball):
         ms = round((time.perf_counter() - t0) * 1000)
         log(f"⚡ [CLICK-CACHE] {side_want} {line_want} "
             f"panel={want_over}-{want_del} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        _last_clicked_want = (want_over, want_del)   # ⭐ mark clicked
+        _last_clicked_want = (want_over, want_del)
         panel_cache["ts"] = 0
         return True
 
-    # ═══ FRESH OCR ═══
     ax, ay = find_anchor_fast(page)
     if ax is None:
         log(f"❌ [NO-ANCHOR]")
@@ -520,7 +483,7 @@ def process_event(page, ball_key, run, kind, over_num, ball, xball):
         ms = round((time.perf_counter() - t0) * 1000)
         log(f"✅ [CLICK-OCR] {side_want} {line_want} "
             f"panel={want_over}-{want_del} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        _last_clicked_want = (want_over, want_del)   # ⭐ mark clicked
+        _last_clicked_want = (want_over, want_del)
         panel_cache["ts"] = 0
         return True
 
@@ -622,7 +585,7 @@ def start_ws_thread():
 # ══════════════════════════════════════════════════════════════
 def monitor_and_click():
     if len(sys.argv) < 2:
-        print("Usage: python clicker_v12_fixed.py <match_key>")
+        print("Usage: python clicker.py <match_key>")
         return
     match_filter = sys.argv[1].strip()
     WS_STATE["match_filter"] = match_filter
@@ -713,7 +676,7 @@ def monitor_and_click():
 
         start_ws_thread()
         log(f"👂 [WS] waiting... (match_key={match_filter})")
-        log(f"   💡 v12.1 FIXED: no double-click, strict dot/wicket → under 0.5")
+        log(f"   💡 v12.1 (no image save)")
         log(f"   💡 want = (over+1, ball)  [exact only]")
         log(f"   💡 cache fresh <{CACHE_FRESH_SEC*1000:.0f}ms → click 10ms")
         log(f"   💡 idle refresh every {IDLE_REFRESH_SEC*1000:.0f}ms"
