@@ -1,21 +1,36 @@
 """
-clicker.py — v12.1 FIXED (no image save)
-========================================
-v12 + fixes:
-  1. ⭐ Double-click fix: same (over, delivery) = 1 click only
-  2. ⭐ Dot/wicket (run=0) → ONLY under 0.5, NO fallback
-  3. ⭐ run>=1 → highest mapped over line < run
-  4. ⭐ Faster cache: CACHE_FRESH_SEC=0.15, IDLE_REFRESH_SEC=0.1
-  5. ⭐ Exact panel match only — no want+1, no rollover
-  6. ⭐ No image save (no ocr_success.png / ocr_fail_N.png)
+clicker.py — v13 (compatible with main.py v8, production hardened)
+==================================================================
+Compatibility with main.py v8:
+  - Binary WS frames handled (bytes + str)
+  - WS auth token via ?token= (env CLICKER_WS_TOKEN)
+  - Handles t="reset" message from watch switch
+  - Handles t="ev" and t="match" messages
+  - xball field consumed (requires server patch, included)
+
+Production hardening:
+  - Bounded event queue (max 500) -> no memory leak
+  - WS reconnect with logging
+  - Set-based click dedup (last 20 balls)
+  - Exception guard around mouse operations
+  - Env/CLI overrides for input() calls (headless friendly)
+  - English-only logs
+  - Anchor re-validated every 30s
+  - Graceful shutdown via threading.Event
 
 Env:
-  CLICKER_HEADLESS    1 = headless (default 0)
-  CLICKER_DEBUG       1 = verbose (default 0)
-  CLICKER_NO_IDLE     1 = disable idle cache (default 0)
-  TESSERACT_CMD       custom tesseract path
+  CLICKER_WS_URL           default ws://127.0.0.1:5000/ws
+  CLICKER_WS_TOKEN         optional WS auth token (?token=)
+  CLICKER_HEADLESS         1 = headless browser
+  CLICKER_DEBUG            1 = verbose
+  CLICKER_NO_IDLE          1 = disable idle cache refresh
+  CLICKER_SITE_URL         optional; otherwise prompted
+  CLICKER_MATCH_URL        optional; otherwise prompted
+  CLICKER_PROXY_URL        optional proxy URL
+  TESSERACT_CMD            custom tesseract path
 """
 import asyncio
+import collections
 import json
 import os
 import queue
@@ -24,6 +39,7 @@ import re
 import sys
 import threading
 import time
+import urllib.parse
 
 import websockets
 from playwright.sync_api import sync_playwright
@@ -32,7 +48,14 @@ import cv2
 import pytesseract
 
 # ================= CONFIG =================
-WS_URL = "ws://127.0.0.1:5000/ws"
+_WS_URL_BASE = os.environ.get("CLICKER_WS_URL", "ws://127.0.0.1:5000/ws")
+_WS_TOKEN = os.environ.get("CLICKER_WS_TOKEN", "").strip()
+if _WS_TOKEN:
+    _sep = "&" if "?" in _WS_URL_BASE else "?"
+    WS_URL = f"{_WS_URL_BASE}{_sep}token={urllib.parse.quote(_WS_TOKEN)}"
+else:
+    WS_URL = _WS_URL_BASE
+
 RECONNECT_SEC = 3
 PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
@@ -43,13 +66,15 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# ── Timing ──
+# -- Timing --
 CACHE_FRESH_SEC = 0.15
 IDLE_REFRESH_SEC = 0.1
-ANCHOR_TRUST_SEC = 300
+ANCHOR_TRUST_SEC = 30        # was 300; re-validate sooner
 EVENT_TIMEOUT_SEC = 0.1
+CLICK_DEDUP_WINDOW = 20      # remember last N clicked balls
+EVENT_Q_MAXSIZE = 500        # bounded event queue
 
-# ── OCR ──
+# -- OCR --
 COMPARE_THRESHOLD = 0.70
 CACHE_VERIFY_THRESHOLD = 0.82
 HEADER_CROP_W = 240
@@ -58,7 +83,7 @@ OCR_CFG_HEADER = '--oem 1 --psm 6'
 OCR_CFG_HEADER_FALLBACK = '--oem 1 --psm 7'
 OCR_CFG_SETUP = '--oem 1 --psm 6'
 
-# ── Viewport / anchor ──
+# -- Viewport / anchor --
 VIEW_W = 1080
 VIEW_H = 797
 WIN_W = VIEW_W + 100
@@ -70,7 +95,7 @@ ANCHOR_W = 100
 ANCHOR_H = 34
 TARGET_ROWS = 3
 
-# ── State ──
+# -- State --
 ANCHOR_TEMPLATE = {}
 MAPPED_TARGETS = []
 CALIBRATED_ANCHOR_POS = None
@@ -81,10 +106,12 @@ panel_cache = {
     "over": None, "del": None, "ts": 0.0, "ax": None, "ay": None,
 }
 
-_last_clicked_want = None
+# Set-based dedup: remember last N clicked (over, del) tuples
+_recent_clicked = collections.deque(maxlen=CLICK_DEDUP_WINDOW)
 
 WS_STATE = {"match_filter": "", "up": False, "msg_count": 0, "last_ts": 0.0}
-event_q = queue.SimpleQueue()
+event_q = queue.Queue(maxsize=EVENT_Q_MAXSIZE)
+_stop_event = threading.Event()
 
 INTERMEDIATE_PATTERNS = [
     r'^ball\b.*\b(chalu|start|chalo|shuru|shuro)',
@@ -95,28 +122,31 @@ INTERMEDIATE_PATTERNS = [
 ]
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  UTIL
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
 
 def dbg(msg):
     if DEBUG:
         print(f"[{time.strftime('%H:%M:%S')}] [DBG] {msg}", flush=True)
 
+
 def is_intermediate(ev):
     ev_low = ev.lower().strip()
     return any(re.search(p, ev_low) for p in INTERMEDIATE_PATTERNS)
+
 
 def is_ball_chalu(ev):
     return bool(re.search(r'^ball\b.*\b(chalu|start|chalo|shuru|shuro)',
                           ev.lower().strip()))
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  JS (calibration UI)
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 SHOW_TARGETS_JS = """
 () => {
     let box = document.getElementById('__pw_target_guide');
@@ -174,12 +204,12 @@ SHOW_TARGETS_JS = """
 """
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  CALIBRATION
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def setup_from_done(page, final_targets):
     global CALIBRATED_ANCHOR_POS, last_anchor_pos, _anchor_trust_until
-    log("⚙️  স্ক্রিন থেকে নীল বক্স (Anchor) এবং লাল বক্সের লেখা সেভ করা হচ্ছে...")
+    log("Saving anchor + target box text from screen...")
 
     page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
     page.wait_for_timeout(1000)
@@ -187,7 +217,7 @@ def setup_from_done(page, final_targets):
     raw = page.screenshot(type="png", scale="css")
     src_img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
 
-    anchor_img = src_img[ANCHOR_TOP:ANCHOR_TOP+ANCHOR_H, ANCHOR_LEFT:ANCHOR_LEFT+ANCHOR_W]
+    anchor_img = src_img[ANCHOR_TOP:ANCHOR_TOP + ANCHOR_H, ANCHOR_LEFT:ANCHOR_LEFT + ANCHOR_W]
     ANCHOR_TEMPLATE.update({"img": anchor_img, "w": ANCHOR_W, "h": ANCHOR_H})
     res = cv2.matchTemplate(src_img, anchor_img, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
@@ -195,7 +225,7 @@ def setup_from_done(page, final_targets):
         CALIBRATED_ANCHOR_POS = max_loc
         last_anchor_pos = max_loc
         _anchor_trust_until = time.time() + ANCHOR_TRUST_SEC
-    log(f"   ✅ Anchor সেভ (conf={max_val:.2f})")
+    log(f"   Anchor saved (conf={max_val:.2f})")
 
     MAPPED_TARGETS.clear()
     KNOWN_LINES = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
@@ -204,12 +234,12 @@ def setup_from_done(page, final_targets):
     for i, t in enumerate(final_targets[:max_boxes]):
         x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
         side_hint = (t.get('side') or '').lower()
-        crop = src_img[y:y+h, x:x+w]
+        crop = src_img[y:y + h, x:x + w]
         if crop.size == 0:
             continue
         crop_r = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         text = pytesseract.image_to_string(crop_r, config=OCR_CFG_SETUP).lower()
-        log(f"      🔍 [BOX {i}] side={side_hint or '?'}  OCR={text!r}")
+        log(f"      [BOX {i}] side={side_hint or '?'} OCR={text!r}")
 
         side = side_hint if side_hint in ('over', 'under') else ('over' if i % 2 == 0 else 'under')
         line = None
@@ -236,23 +266,25 @@ def setup_from_done(page, final_targets):
             line = KNOWN_LINES[i // 2] if (i // 2) < len(KNOWN_LINES) else 0.5
 
         MAPPED_TARGETS.append({"side": side, "line": line, "x": x, "y": y, "w": w, "h": h})
-        log(f"      ✅ ম্যাপিং: {side.upper()} {line}")
+        log(f"      Mapping: {side.upper()} {line}")
 
-    log(f"   🎯 ম্যাপ হয়েছে {len(MAPPED_TARGETS)}/{max_boxes}টি টার্গেট")
+    log(f"   Mapped {len(MAPPED_TARGETS)}/{max_boxes} targets")
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  DECIDE TARGET
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def _has_mapped(side, line):
     return any(t["side"] == side and abs(t["line"] - line) < 0.01
                for t in MAPPED_TARGETS)
+
 
 def find_target(side, line):
     for t in MAPPED_TARGETS:
         if t["side"] == side and abs(t["line"] - line) < 0.01:
             return t
     return None
+
 
 def decide_side_line(run, kind):
     if run == 0:
@@ -265,9 +297,9 @@ def decide_side_line(run, kind):
     return (None, None)
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  ANCHOR
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def find_anchor_fast(page):
     global CALIBRATED_ANCHOR_POS, last_anchor_pos, _anchor_trust_until
     now = time.time()
@@ -306,9 +338,9 @@ def find_anchor_fast(page):
     return None, None
 
 
-# ══════════════════════════════════════════════════════════════
-#  OCR (no image save)
-# ══════════════════════════════════════════════════════════════
+# ============================================================
+#  OCR
+# ============================================================
 _OCR_DIAG = {"fail_count": 0}
 
 
@@ -339,7 +371,6 @@ def refresh_panel_header(page, ax, ay, probe_x, probe_y, probe_h):
             if text:
                 break
 
-        # ⭐ Only log first 5 failures — NO image save
         if not text and _OCR_DIAG["fail_count"] < 5:
             _OCR_DIAG["fail_count"] += 1
             n = _OCR_DIAG["fail_count"]
@@ -368,7 +399,7 @@ def refresh_panel_header(page, ax, ay, probe_x, probe_y, probe_h):
         panel_cache["ax"] = ax
         panel_cache["ay"] = ay
         if DEBUG and old != (po, pd):
-            dbg(f"cache {old}→({po},{pd})")
+            dbg(f"cache {old}->({po},{pd})")
         return True
     except Exception as e:
         dbg(f"OCR err: {e}")
@@ -380,16 +411,20 @@ def do_click(page, target_box, ax, ay):
     y = ay + (target_box["y"] - ANCHOR_TOP)
     cx = x + target_box["w"] / 2
     cy = y + target_box["h"] / 2
-    page.mouse.move(cx, cy, steps=1)
-    page.mouse.down()
-    page.wait_for_timeout(random.randint(2, 5))
-    page.mouse.up()
+    try:
+        page.mouse.move(cx, cy, steps=1)
+        page.mouse.down()
+        page.wait_for_timeout(random.randint(2, 5))
+        page.mouse.up()
+    except Exception as e:
+        log(f"   Click error: {e}")
+        return None, None
     return cx, cy
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  WANT COMPUTE
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def parse_over_ball(d):
     ov = d.get("over")
     if ov is None:
@@ -427,49 +462,48 @@ def compute_want(over_num, ball, xball):
     return (over_num + 1, xball if xball is not None else ball)
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  PROCESS EVENT
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def process_event(page, ball_key, run, kind, over_num, ball, xball):
-    global _last_clicked_want
-
     t0 = time.perf_counter()
     want_over, want_del = compute_want(over_num, ball, xball)
     side_want, line_want = decide_side_line(run, kind)
 
-    if _last_clicked_want == (want_over, want_del):
-        log(f"⏭️ [ALREADY-CLICKED] want={want_over}-{want_del} "
-            f"(ev={ball_key}) — same ball already clicked")
+    if (want_over, want_del) in _recent_clicked:
+        log(f"[ALREADY-CLICKED] want={want_over}-{want_del} (ev={ball_key})")
         return False
 
-    log(f"🎯 [TARGET] {ball_key} run={run}({kind}) → "
+    log(f"[TARGET] {ball_key} run={run}({kind}) -> "
         f"{side_want} {line_want} | want={want_over}-{want_del}")
 
     if side_want is None:
-        log(f"❌ [NO-MAPPED-LINE] run={run} — skipping (no exact button)")
+        log(f"[NO-MAPPED-LINE] run={run} - skipping (no exact button)")
         return False
 
     target_box = find_target(side_want, line_want)
     if not target_box:
-        log(f"❌ [NO-TARGET] {side_want} {line_want}")
+        log(f"[NO-TARGET] {side_want} {line_want}")
         return False
 
     cache_age = time.time() - panel_cache["ts"]
     if (cache_age < CACHE_FRESH_SEC and
-        panel_cache["over"] == want_over and
-        panel_cache["del"] == want_del and
-        panel_cache["ax"] is not None):
+            panel_cache["over"] == want_over and
+            panel_cache["del"] == want_del and
+            panel_cache["ax"] is not None):
         cx, cy = do_click(page, target_box, panel_cache["ax"], panel_cache["ay"])
+        if cx is None:
+            return False
         ms = round((time.perf_counter() - t0) * 1000)
-        log(f"⚡ [CLICK-CACHE] {side_want} {line_want} "
+        log(f"[CLICK-CACHE] {side_want} {line_want} "
             f"panel={want_over}-{want_del} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        _last_clicked_want = (want_over, want_del)
+        _recent_clicked.append((want_over, want_del))
         panel_cache["ts"] = 0
         return True
 
     ax, ay = find_anchor_fast(page)
     if ax is None:
-        log(f"❌ [NO-ANCHOR]")
+        log(f"[NO-ANCHOR]")
         return False
 
     tx = ax + (target_box["x"] - ANCHOR_LEFT)
@@ -477,25 +511,27 @@ def process_event(page, ball_key, run, kind, over_num, ball, xball):
     refresh_panel_header(page, ax, ay, tx, ty, target_box["h"])
 
     if (panel_cache["over"] == want_over and
-        panel_cache["del"] == want_del and
-        panel_cache["ax"] is not None):
+            panel_cache["del"] == want_del and
+            panel_cache["ax"] is not None):
         cx, cy = do_click(page, target_box, panel_cache["ax"], panel_cache["ay"])
+        if cx is None:
+            return False
         ms = round((time.perf_counter() - t0) * 1000)
-        log(f"✅ [CLICK-OCR] {side_want} {line_want} "
+        log(f"[CLICK-OCR] {side_want} {line_want} "
             f"panel={want_over}-{want_del} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        _last_clicked_want = (want_over, want_del)
+        _recent_clicked.append((want_over, want_del))
         panel_cache["ts"] = 0
         return True
 
     ms = round((time.perf_counter() - t0) * 1000)
-    log(f"⏭️ [MISS] panel={panel_cache['over']}-{panel_cache['del']} "
-        f"≠ want={want_over}-{want_del} [+{ms}ms]")
+    log(f"[MISS] panel={panel_cache['over']}-{panel_cache['del']} "
+        f"!= want={want_over}-{want_del} [+{ms}ms]")
     return False
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  BALL INFO
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def ball_info(d):
     ev = str(d.get("ev") or "").strip()
     ev_low = ev.lower()
@@ -524,21 +560,21 @@ def ball_info(d):
     return (ev, "intermediate", 0)
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  WS
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 async def ws_loop():
-    while True:
+    while not _stop_event.is_set():
         mf = WS_STATE.get("match_filter") or ""
         try:
             async with websockets.connect(WS_URL, ping_interval=None,
                                           compression=None, max_size=None) as ws:
                 WS_STATE["up"] = True
-                log(f"🔌 [WS] connected: {WS_URL}")
+                log(f"[WS] connected: {WS_URL}")
                 if mf:
                     try:
                         await ws.send(f"watch:{mf}")
-                        log(f"👁️  Watching match: {mf}")
+                        log(f"Watching match: {mf}")
                     except Exception:
                         pass
 
@@ -553,36 +589,62 @@ async def ws_loop():
                 ptask = asyncio.create_task(pinger())
                 try:
                     async for raw in ws:
-                        if raw == "pong":
+                        # Handle both str and bytes (WS_BINARY=1 sends bytes)
+                        if raw == "pong" or raw == b"pong":
                             continue
+                        if isinstance(raw, (bytes, bytearray)):
+                            try:
+                                raw = raw.decode("utf-8", errors="replace")
+                            except Exception:
+                                continue
                         try:
                             m = json.loads(raw)
                         except (ValueError, TypeError):
                             continue
+
+                        # Filter by match id
                         mid_msg = m.get("id")
                         if mf and mid_msg and str(mid_msg) != str(mf):
                             continue
+
+                        # Handle reset from watch switch
+                        if m.get("t") == "reset":
+                            log(f"[RESET] {m.get('from')} -> {m.get('to')}")
+                            _recent_clicked.clear()
+                            continue
+
                         WS_STATE["msg_count"] += 1
                         WS_STATE["last_ts"] = time.time()
-                        event_q.put(m)
+                        try:
+                            event_q.put_nowait(m)
+                        except queue.Full:
+                            dbg("event_q full - dropping message")
                 finally:
                     ptask.cancel()
         except asyncio.CancelledError:
             return
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[WS] disconnected: {type(e).__name__}: {e}")
         finally:
             WS_STATE["up"] = False
+        if _stop_event.is_set():
+            return
         await asyncio.sleep(RECONNECT_SEC)
 
 
 def start_ws_thread():
-    threading.Thread(target=lambda: asyncio.run(ws_loop()), daemon=True).start()
+    def _run():
+        try:
+            asyncio.run(ws_loop())
+        except Exception as e:
+            log(f"[WS] thread crashed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 #  MAIN
-# ══════════════════════════════════════════════════════════════
+# ============================================================
 def monitor_and_click():
     if len(sys.argv) < 2:
         print("Usage: python clicker.py <match_key>")
@@ -593,11 +655,15 @@ def monitor_and_click():
     if TESSERACT_CMD:
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-    site_url = input("\nSite link din: ").strip() or "https://example.com"
+    site_url = os.environ.get("CLICKER_SITE_URL", "").strip()
+    if not site_url:
+        site_url = input("\nSite URL: ").strip() or "https://example.com"
 
     proxy_config = None
-    print("\n=== Proxy Settings (IPRoyal) ===")
-    proxy_url = input("Proxy URL [Leave blank to skip]: ").strip()
+    proxy_url = os.environ.get("CLICKER_PROXY_URL", "").strip()
+    if not proxy_url:
+        print("\n=== Proxy Settings ===")
+        proxy_url = input("Proxy URL [Enter to skip]: ").strip()
     if proxy_url:
         try:
             if "@" in proxy_url:
@@ -608,16 +674,16 @@ def monitor_and_click():
                                 "username": user, "password": pwd}
             else:
                 proxy_config = {"server": proxy_url}
-            log(f"✅ Proxy: {proxy_config['server']}")
+            log(f"Proxy: {proxy_config['server']}")
         except Exception as e:
-            log(f"❌ Proxy error: {e}")
+            log(f"Proxy error: {e}")
     else:
-        log("⏭️ Proxy skipped.")
+        log("Proxy skipped.")
 
     try:
         pytesseract.image_to_string(np.zeros((30, 100), dtype=np.uint8),
                                     config=OCR_CFG_HEADER)
-        log("   🔥 Tesseract warmed up")
+        log("Tesseract warmed up")
     except Exception:
         pass
 
@@ -636,25 +702,27 @@ def monitor_and_click():
         page = context.new_page()
         page.goto(site_url)
 
-        print("\n=== log in manually ===")
-        match_url = input("Match URL: ").strip()
+        match_url = os.environ.get("CLICKER_MATCH_URL", "").strip()
+        if not match_url:
+            print("\n=== log in manually ===")
+            match_url = input("Match URL: ").strip()
         if not match_url:
             browser.close()
             return
         page.goto(match_url)
-        log(f"✅ Match page: {page.url}")
+        log(f"Match page: {page.url}")
 
         print("\n" + "=" * 65)
-        print("👉 go to browser and select 'Quick Events'")
-        print("👉 adjust Red Box below Blue Box")
-        print("👉 if all is well click 'DONE'")
+        print("Go to browser and select 'Quick Events'")
+        print("Adjust red boxes below the blue anchor box")
+        print("Click 'DONE' when ready")
         print("=" * 65 + "\n")
 
-        while True:
+        while not _stop_event.is_set():
             page.evaluate("() => { window.__pw_action = null; }")
             page.evaluate(SHOW_TARGETS_JS)
-            print("⏳ set target on your browser (DONE / + / - / RESET)...")
-            while True:
+            print("Waiting for calibration (DONE / + / - / RESET)...")
+            while not _stop_event.is_set():
                 action = page.evaluate("() => window.__pw_action")
                 if action in ('done', 'update', 'reset'):
                     break
@@ -670,22 +738,22 @@ def monitor_and_click():
                 continue
 
         if not MAPPED_TARGETS:
-            log("⚠️ কোনো টার্গেট ম্যাপ হয়নি — বন্ধ।")
+            log("No targets mapped - aborting.")
             browser.close()
             return
 
         start_ws_thread()
-        log(f"👂 [WS] waiting... (match_key={match_filter})")
-        log(f"   💡 v12.1 (no image save)")
-        log(f"   💡 want = (over+1, ball)  [exact only]")
-        log(f"   💡 cache fresh <{CACHE_FRESH_SEC*1000:.0f}ms → click 10ms")
-        log(f"   💡 idle refresh every {IDLE_REFRESH_SEC*1000:.0f}ms"
+        log(f"[WS] waiting... (match_key={match_filter})")
+        log(f"   v13 - compatible with main.py v8")
+        log(f"   want = (over+1, xball|ball)  [exact only]")
+        log(f"   cache fresh <{CACHE_FRESH_SEC*1000:.0f}ms -> click ~10ms")
+        log(f"   idle refresh every {IDLE_REFRESH_SEC*1000:.0f}ms"
             f"{' [DISABLED]' if NO_IDLE else ''}\n")
 
         last_dedup_key = None
 
         try:
-            while True:
+            while not _stop_event.is_set():
                 try:
                     m = event_q.get(timeout=EVENT_TIMEOUT_SEC)
                 except queue.Empty:
@@ -717,7 +785,7 @@ def monitor_and_click():
                 over_str = str(m.get("over") or "")
                 dedup_key = f"{over_str}|{ev}"
                 if dedup_key == last_dedup_key:
-                    log(f"⏭️ [DUP] {dedup_key}")
+                    log(f"[DUP] {dedup_key}")
                     continue
                 last_dedup_key = dedup_key
 
@@ -735,7 +803,7 @@ def monitor_and_click():
                     lag_str = f" | lag={round(time.time()*1000 - srv_ts, 1)}ms"
 
                 xb_str = f" xball={xball}" if xball is not None else ""
-                log(f"🏏 [EV] ev={text} kind={kind} run={run} | "
+                log(f"[EV] ev={text} kind={kind} run={run} | "
                     f"over={m.get('over')} ball={m.get('ball')}{xb_str}{lag_str}")
 
                 process_event(
@@ -744,8 +812,9 @@ def monitor_and_click():
                 )
 
         except KeyboardInterrupt:
-            print("\n closing...")
+            print("\nClosing...")
         finally:
+            _stop_event.set()
             try:
                 browser.close()
             except Exception:
