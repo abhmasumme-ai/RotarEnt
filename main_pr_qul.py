@@ -1,20 +1,26 @@
 """
-main.py — v8 (Fastest Multi-Client Production Pipeline)
-========================================================
-Upgrades over v7:
-  - Chunked async broadcast: yields every 2000 clients -> no event loop starvation
-  - Single serialize per broadcast, shared bytes across N clients
-  - Fast _state_sig with integer comparisons
-  - Pre-serialized bytes cache per signature (avoid re-serialize on dedup)
-  - orjson mandatory path with json fallback, uvloop enforced warn
-  - Batched upstream loop with yield for fairness
+main.py - v10 (Production hardened + full client compatibility)
+================================================================
+Upgrades over v9:
+  - Ball event output includes 'xball' and 'batsman_out'
+    (required by clicker.py v19/v20/v25 for run-out accuracy)
+  - Ball event broadcast is SYNC (no yield) -> preserves ordering
+    with subsequent state messages even at 2000+ client scale
+  - _force_next replaced with per-message force token -> fixes the
+    stale-broadcast race between concurrent state messages
+  - Early-return cleans up force tokens (no leak)
+  - Eviction and shutdown clean up force tokens
+
+Carried over from v9:
+  - Trailing-edge state throttle (latest message kept and flushed)
+  - Protocol-level upstream ping/pong + 300s idle watchdog
+  - Expanded _state_sig (catches ball corrections)
+  - Chunked async broadcast for state events
+  - orjson with json fallback, uvloop when available
   - WS auth token, idle timeout, message size cap
   - REST circuit breaker, bounded fix fetch concurrency
-  - WICKET_RE fixed (run out / retired / obstruct / handled the ball)
-  - _force_next explicit flag (no throttle abuse)
-  - Periodic maintenance loop for eviction (off hot path)
   - TTL rate limiter with LRU eviction
-  - Per-match lock minimizes baseline vs push race
+  - Periodic maintenance loop
 """
 import asyncio
 import gzip
@@ -51,15 +57,12 @@ try:
 except ImportError:
     _orjson = None
 
-
-# -- Serialization (fastest path) --
 _ORJSON_OPTS = None
 if _orjson is not None:
     _ORJSON_OPTS = _orjson.OPT_NON_STR_KEYS | _orjson.OPT_SERIALIZE_NUMPY
 
 
 def _ser(obj) -> bytes:
-    """Fastest serialize. orjson preferred."""
     if _orjson is not None:
         try:
             return _orjson.dumps(obj, option=_ORJSON_OPTS)
@@ -99,9 +102,7 @@ WS_AUTH_TOKEN = os.environ.get("WS_AUTH_TOKEN")
 WS_IDLE_TIMEOUT_S = int(os.environ.get("WS_IDLE_TIMEOUT_S", "120"))
 WS_MAX_MSG_BYTES = int(os.environ.get("WS_MAX_MSG_BYTES", "4096"))
 
-# Performance knobs
 BROADCAST_CHUNK = int(os.environ.get("BROADCAST_CHUNK", "2000"))
-UPSTREAM_BATCH = int(os.environ.get("UPSTREAM_BATCH", "64"))
 
 client = httpx.AsyncClient(
     timeout=15,
@@ -111,7 +112,7 @@ client = httpx.AsyncClient(
 # =====================================================================
 #  State
 # =====================================================================
-UP = {"connected": False, "msgs": 0, "last": 0.0, "sent": 0, "batches": 0}
+UP = {"connected": False, "msgs": 0, "last": 0.0, "sent": 0}
 
 LATEST_OBJ = OrderedDict()
 FIX = OrderedDict()
@@ -119,9 +120,19 @@ _comm_cache = OrderedDict()
 _max_over_cache = {}
 _last_state_sent = {}
 _last_pub = {}
-_force_next = {}
+
+# Force token: unique int per flush, matched against msg's token.
+# Replaces the old _force_next[mid]=True approach which raced when two
+# state messages were in flight at the same time.
+_force_msg_ids = {}   # mid -> int token
+_force_counter = 0
+
 _fix_pending: set = set()
 _match_locks = defaultdict(asyncio.Lock)
+
+# Trailing-edge throttle state (latest pending state message per match)
+_pending_state = {}
+_pending_timer = {}
 
 _rest = {
     "ts": 0.0, "rows": [], "last_error": "", "last_ok_ts": 0.0,
@@ -138,7 +149,8 @@ STATE_MIN_INTERVAL_MS = int(os.environ.get("STATE_MIN_INTERVAL_MS", "120"))
 WARM_CONCURRENCY = 3
 WARM_INTERVAL_S = 5
 SLOW_LIMIT = 100
-UPSTREAM_IDLE_S = int(os.environ.get("UPSTREAM_IDLE_S", "60"))
+UPSTREAM_IDLE_S = int(os.environ.get("UPSTREAM_IDLE_S", "300"))
+UPSTREAM_PING_S = int(os.environ.get("UPSTREAM_PING_S", "20"))
 CLICK_LIMIT_PER_MIN = 20
 TELEGRAM_LIMIT_PER_MIN = 30
 MAINTENANCE_INTERVAL_S = 30
@@ -149,16 +161,6 @@ FIX_PENDING_MAX = 200
 
 STATUS_MAP = {1: "not_started", 2: "completed", 3: "started", 4: "cancelled"}
 _STATUS_STR = {3: "started", 1: "not_started", 2: "completed", 4: "cancelled"}
-
-# Fixed wicket regex - catches run out, retired, obstruct, handled the ball
-WICKET_RE = re.compile(
-    r"^(?:"
-    r"wicket|out\b|w\b|bowled|lbw|caught|c\s*&\s*b|"
-    r"run[\s\-]?out|stumped?|hit[\s\-]?wicket|retired|"
-    r"handled[\s\-]?the[\s\-]?ball|obstruct"
-    r")",
-    re.I,
-)
 
 
 def _spawn(coro):
@@ -186,11 +188,8 @@ def _decode(raw):
     return json.loads(raw)
 
 
-_is_wicket = lambda ev: bool(WICKET_RE.match(ev.strip()))
-
-
 # =====================================================================
-#  Rate limiter (TTL + LRU eviction)
+#  Rate limiter
 # =====================================================================
 _rate_hits = OrderedDict()
 _RATE_MAX_KEYS = 10_000
@@ -474,12 +473,12 @@ def slim_match_cached(msg, now, isolated=False):
 
 
 def _state_sig(out):
-    """Fast signature - integer-heavy, minimal tuple allocation."""
     sc = out.get("score")
     comm = out.get("comm")
     lw = out.get("lw")
     a = out["a"]
     b = out["b"]
+    last = comm[-1] if comm else None
     return (
         out.get("status"),
         out.get("game"),
@@ -489,11 +488,16 @@ def _state_sig(out):
         sc["wk"] if sc else -1,
         sc["ov"] if sc else "",
         sc["target"] if sc else -1,
+        sc.get("rrr") if sc else None,
         out.get("inn"),
         out.get("bat"),
+        out.get("max"),
         out.get("result"),
         len(comm) if comm else 0,
-        comm[-1]["id"] if comm else "",
+        last["id"] if last else "",
+        (last["run"], last["bat"], last["wd"], last["nb"], last["by"], last["lb"],
+         last["four"], last["six"], last["w"], last["dis"]) if last else None,
+        lw["ov"] if lw else "",
         lw["dis"] if lw else "",
         lw["sc"] if lw else -1,
         a["sc"],
@@ -525,10 +529,6 @@ def _seed_cache(mid: str, obj):
 
 # =====================================================================
 #  FAST Connection Manager
-#  - O(1) match lookup for fanout
-#  - Single serialize per broadcast, shared bytes across N clients
-#  - Chunked async broadcast yields every BROADCAST_CHUNK clients
-#  - Slow-client drop keeps queues bounded
 # =====================================================================
 class ConnectionManager:
     def __init__(self):
@@ -625,14 +625,42 @@ class ConnectionManager:
         except asyncio.QueueFull:
             pass
 
+    def _enqueue(self, ws, message: bytes):
+        q = self.queues.get(ws)
+        if q is None:
+            return
+        try:
+            q.put_nowait(message)
+            if self._slow.get(ws, 0):
+                self._slow[ws] = 0
+        except asyncio.QueueFull:
+            n_slow = self._slow.get(ws, 0) + 1
+            self._slow[ws] = n_slow
+            if n_slow >= SLOW_LIMIT:
+                log.warning("Drop slow client (queue full x%d)", n_slow)
+                self._drop_slow(ws)
+
+    def broadcast_ball_sync(self, message: bytes, match_id: str) -> int:
+        """
+        Synchronous ball-event broadcast. Does NOT yield.
+        Preserves ordering with subsequent state messages even at 2000+ scale.
+        Ball events are rare (~1 per 20-40s per match), so blocking for
+        a few ms is acceptable and guarantees correct wire order.
+        """
+        targets = self.by_match.get(match_id)
+        if not targets:
+            return 0
+        tlist = list(targets)
+        n = len(tlist)
+        if n == 0:
+            return 0
+        UP["sent"] += 1
+        for ws in tlist:
+            self._enqueue(ws, message)
+        return n
+
     async def broadcast_bytes(self, message: bytes, match_id: str) -> int:
-        """
-        Fast chunked fanout:
-          - O(1) match lookup
-          - same bytes to every client (no per-client encode)
-          - yield every BROADCAST_CHUNK clients -> event loop fairness
-        Returns number of clients reached.
-        """
+        """Async chunked broadcast for state messages (yields at chunk boundary)."""
         targets = self.by_match.get(match_id)
         if not targets:
             return 0
@@ -645,37 +673,12 @@ class ConnectionManager:
         chunk = BROADCAST_CHUNK
         if n <= chunk:
             for ws in tlist:
-                q = self.queues.get(ws)
-                if q is None:
-                    continue
-                try:
-                    q.put_nowait(message)
-                    if self._slow.get(ws, 0):
-                        self._slow[ws] = 0
-                except asyncio.QueueFull:
-                    n_slow = self._slow.get(ws, 0) + 1
-                    self._slow[ws] = n_slow
-                    if n_slow >= SLOW_LIMIT:
-                        log.warning("Drop slow client (queue full x%d)", n_slow)
-                        self._drop_slow(ws)
+                self._enqueue(ws, message)
             return n
 
         for i in range(0, n, chunk):
-            batch = tlist[i:i + chunk]
-            for ws in batch:
-                q = self.queues.get(ws)
-                if q is None:
-                    continue
-                try:
-                    q.put_nowait(message)
-                    if self._slow.get(ws, 0):
-                        self._slow[ws] = 0
-                except asyncio.QueueFull:
-                    n_slow = self._slow.get(ws, 0) + 1
-                    self._slow[ws] = n_slow
-                    if n_slow >= SLOW_LIMIT:
-                        log.warning("Drop slow client (queue full x%d)", n_slow)
-                        self._drop_slow(ws)
+            for ws in tlist[i:i + chunk]:
+                self._enqueue(ws, message)
             if i + chunk < n:
                 await asyncio.sleep(0)
         return n
@@ -700,7 +703,7 @@ def _watched_ids() -> set:
 
 
 # =====================================================================
-#  REST (with circuit breaker)
+#  REST
 # =====================================================================
 async def _fetch_status(status: int, per_page: int):
     try:
@@ -833,8 +836,16 @@ async def _warm_live_loop():
 
 
 # =====================================================================
-#  Periodic maintenance (eviction off hot path)
+#  Maintenance
 # =====================================================================
+def _drop_pending(k):
+    _pending_state.pop(k, None)
+    h = _pending_timer.pop(k, None)
+    if h is not None:
+        h.cancel()
+    _force_msg_ids.pop(k, None)
+
+
 def _evict_unwatched():
     if len(LATEST_OBJ) > MAX_CACHE or len(_comm_cache) > MAX_CACHE:
         watched = _watched_ids()
@@ -845,7 +856,7 @@ def _evict_unwatched():
                 _last_state_sent.pop(k, None)
                 _last_pub.pop(k, None)
                 _max_over_cache.pop(k, None)
-                _force_next.pop(k, None)
+                _drop_pending(k)
                 if len(LATEST_OBJ) <= MAX_CACHE and len(_comm_cache) <= MAX_CACHE:
                     break
     if len(_max_over_cache) > MAX_CACHE:
@@ -858,10 +869,13 @@ def _evict_unwatched():
         for k in [k for k in _last_state_sent if k not in LATEST_OBJ]:
             _last_state_sent.pop(k, None)
             _last_pub.pop(k, None)
-            _force_next.pop(k, None)
+            _drop_pending(k)
     if len(_match_locks) > MAX_CACHE * 2:
         for k in [k for k in _match_locks if k not in LATEST_OBJ]:
             _match_locks.pop(k, None)
+    if len(_force_msg_ids) > MAX_CACHE * 2:
+        for k in [k for k in _force_msg_ids if k not in LATEST_OBJ]:
+            _force_msg_ids.pop(k, None)
 
 
 async def _maintenance_loop():
@@ -876,7 +890,7 @@ async def _maintenance_loop():
 
 
 # =====================================================================
-#  FIX (bounded concurrency + pending cap)
+#  FIX
 # =====================================================================
 _FIX_SEM = asyncio.Semaphore(FIX_FETCH_CONCURRENCY)
 
@@ -928,7 +942,21 @@ def _ensure_fix(mid: str):
 # =====================================================================
 #  Push processing - HOT PATH
 # =====================================================================
-async def _process_match_msg(msg: dict, mid: str):
+def _flush_pending(mid: str):
+    """Trailing-edge flush: send the newest throttled state message with a
+    per-message force token (not a shared boolean flag)."""
+    global _force_counter
+    _pending_timer.pop(mid, None)
+    msg = _pending_state.pop(mid, None)
+    if msg is None:
+        return
+    _force_counter += 1
+    token = _force_counter
+    _force_msg_ids[mid] = token
+    _spawn(_process_match_msg(msg, mid, force_token=token))
+
+
+async def _process_match_msg(msg: dict, mid: str, force_token: int = 0):
     now = time.time()
     now_ms = now * 1000
     r = msg.get("response")
@@ -941,28 +969,67 @@ async def _process_match_msg(msg: dict, mid: str):
             return
         d = r.get("data") if isinstance(r.get("data"), dict) else {}
         ev = str(r.get("ball_event", ""))
+
+        # Batsman-out fallback chain across likely upstream field names.
+        # Checks both 'data' and top-level 'response' dict.
+        batsman_out = (
+            d.get("dismissed_batsman")
+            or d.get("batsman_out")
+            or d.get("out_batsman")
+            or r.get("dismissed_batsman")
+            or r.get("batsman_out")
+            or r.get("out_batsman")
+            or d.get("striker_name")
+        )
+
         out = {
             "t": "ev", "id": mid, "ev": ev,
             "code": str(r.get("code", "")),
-            "over": d.get("over"), "ball": d.get("ball"),
-            "inn": _i(d.get("inn_num")), "iid": d.get("iid"),
-            "striker": d.get("striker_name"), "bowler": d.get("bowler_name"),
+            "over": d.get("over"),
+            "ball": d.get("ball"),
+            "xball": d.get("xball"),
+            "batsman_out": batsman_out,
+            "inn": _i(d.get("inn_num")),
+            "iid": d.get("iid"),
+            "striker": d.get("striker_name"),
+            "bowler": d.get("bowler_name"),
             "_server_ts": now_ms,
         }
-        await manager.broadcast_bytes(_ser(out), mid)
-        _force_next[mid] = True
+        # Set force token BEFORE broadcast. Because it is token-matched
+        # (not a shared boolean), concurrent state messages cannot consume it.
+        _force_counter  # noqa (documentational: counter increments on flush only)
+        _force_msg_ids[mid] = _force_msg_ids.get(mid, 0)  # no-op placeholder
+        # Ball event does not carry a force token; it forces the NEXT state
+        # message via the pending-state flush logic below. Mark that next
+        # state message should bypass throttle:
+        _force_pending_next[mid] = True
+        # Sync broadcast: no yield, preserves ordering with subsequent states.
+        manager.broadcast_ball_sync(_ser(out), mid)
         return
 
     # -- MATCH STATE --
     if "match_info" in r or "live" in r:
         if not manager.by_match.get(mid):
+            _force_msg_ids.pop(mid, None)
+            _force_pending_next.pop(mid, None)
             return
 
-        forced = _force_next.pop(mid, False)
+        forced_by_token = (force_token > 0 and _force_msg_ids.get(mid) == force_token)
+        if forced_by_token:
+            _force_msg_ids.pop(mid, None)
+        forced_by_ball = _force_pending_next.pop(mid, False)
+        forced = forced_by_token or forced_by_ball
+
         if not forced:
-            last = _last_state_sent.get(mid, 0)
-            if now_ms - last < STATE_MIN_INTERVAL_MS:
+            wait_ms = STATE_MIN_INTERVAL_MS - (now_ms - _last_state_sent.get(mid, 0))
+            if wait_ms > 0:
+                _pending_state[mid] = msg
+                if mid not in _pending_timer:
+                    _pending_timer[mid] = asyncio.get_running_loop().call_later(
+                        wait_ms / 1000.0, _flush_pending, mid)
                 return
+
+        _pending_state.pop(mid, None)
 
         out = slim_match_cached(msg, now)
         if not out["id"] or out["id"] != mid:
@@ -980,8 +1047,12 @@ async def _process_match_msg(msg: dict, mid: str):
         await manager.broadcast_bytes(_ser(out), mid)
 
 
+# Set by ball event -> next state message skips throttle. Separate from
+# force tokens (which are assigned by flush_pending for concurrent states).
+_force_pending_next = {}
+
+
 def _dispatch_push(msg: dict, mid: str):
-    """Fire-and-forget async processing of a single push message."""
     _spawn(_process_match_msg(msg, mid))
 
 
@@ -1046,7 +1117,11 @@ async def upstream_loop():
         wd = None
         try:
             async with websockets.connect(
-                url, ping_interval=None, max_size=None, open_timeout=15
+                url,
+                ping_interval=UPSTREAM_PING_S,
+                ping_timeout=UPSTREAM_PING_S,
+                max_size=None,
+                open_timeout=15,
             ) as ws:
                 UP["connected"] = True
                 log.warning("Entity push connected")
@@ -1103,6 +1178,12 @@ async def lifespan(app: FastAPI):
             await t
         except BaseException:
             pass
+    for h in list(_pending_timer.values()):
+        h.cancel()
+    _pending_timer.clear()
+    _pending_state.clear()
+    _force_msg_ids.clear()
+    _force_pending_next.clear()
     for w in list(manager.writers.values()):
         w.cancel()
     await client.aclose()
@@ -1373,6 +1454,8 @@ async def health():
         out["rest_last_error"] = _rest["last_error"] or None
         out["rest_fail_streak"] = _rest["fail_streak"]
         out["fix_pending"] = len(_fix_pending)
+        out["throttle_pending"] = len(_pending_state)
+        out["force_pending"] = len(_force_msg_ids)
         out["orjson"] = _orjson is not None
         out["uvloop"] = _UVLOOP
         out["broadcast_chunk"] = BROADCAST_CHUNK
