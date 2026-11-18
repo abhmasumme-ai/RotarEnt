@@ -1,22 +1,29 @@
 /* ========= CONFIG & STATE ========= */
 const SERVED = location.protocol === "http:" || location.protocol === "https:";
+const _urlParams = new URLSearchParams(location.search || "");
+const WS_TOKEN = _urlParams.get("token") || "";
+const OVERS_OVERRIDE = Number(_urlParams.get("overs")) || 0;
+
 const API_BASE = SERVED ? location.origin : "http://127.0.0.1:5000";
-const WS_URL = SERVED
+const WS_URL = (SERVED
   ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"
-  : "ws://127.0.0.1:5000/ws";
+  : "ws://127.0.0.1:5000/ws") + (WS_TOKEN ? `?token=${encodeURIComponent(WS_TOKEN)}` : "");
+
 const TELEGRAM_ID = "@abc_trc123";
 const MAX_LOG = 200;
 const MAX_MS = 1000;
 const RECONNECT_MS = 3000;
+const RECONNECT_JITTER = 0.6;
 const SETTINGS_KEY = "cricketPanelSettings";
-const OVER_DELAY_MS = 0;
-const INN_BREAK_DELAY_MS = 800;
 const FALLBACK_QUIET_MS = 8000;
 const PIE_MIN_MS = 200;
 const FIXTURE_POLL_MS = 15000;
 const BASELINE_RETRY_MS = 3000;
 const BASELINE_MAX_TRIES = 5;
-const WICKET_HOLD_MS = 1200;   // W blink কতক্ষণ, তারপর dismissal text
+const WICKET_HOLD_MS = 700;
+const FETCH_TIMEOUT_MS = 10000;
+const PING_INTERVAL_MS = 30000;
+const MAX_CACHED_MATCHES = 100;
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -35,13 +42,15 @@ const S = {
   started: false, ws: null, ping: null, reconnect: null,
   prevMs: null, label: "", matchKey: "", active: true, auto: false, idle: true,
   fmt: "", cur: null, isFreeHitNext: false, unk: new Set(),
-  oversOverride: Number(new URLSearchParams(location.search || "").get("overs")) || 0,
+  oversOverride: OVERS_OVERRIDE,
 };
 
 let _evSeq = 0;
 let _baselineTimer = null;
+let _baselineAbort = null;
+const _dec = new TextDecoder();
 
-/* ========= Terminal ========= */
+/* ========= Logging ========= */
 function log(msg, err) {
   const t = EL.terminal;
   if (!t) return;
@@ -54,7 +63,9 @@ function log(msg, err) {
   while (t.children.length > MAX_LOG) t.firstChild.remove();
   if (atBottom) t.scrollTop = t.scrollHeight;
 }
-function matchLabel() { return S.label || EL.score?.parentElement?.textContent || "match"; }
+function matchLabel() {
+  return S.label || EL.score?.parentElement?.textContent || "match";
+}
 
 /* ========= Bars ========= */
 const BAR_MIN = 100, BAR_MAX = 5000;
@@ -71,7 +82,7 @@ function setBar(id, ms) {
   }
 }
 
-/* ========= Pie ========= */
+/* ========= Pie chart ========= */
 const GREY = "#555";
 let chart = null;
 function setPie(vals, cols) {
@@ -113,9 +124,6 @@ function pieOnFast(r, b) {
   if (wait === 0) _pieRenderNow();
   else if (!_pieTimer) _pieTimer = setTimeout(_pieRenderNow, wait);
 }
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && _pieData.dirty) _pieRenderNow();
-});
 
 /* ========= Rings ========= */
 const RINGS = [
@@ -138,34 +146,49 @@ function initRings() {
     container.appendChild(b);
   });
 }
-initRings();
 
+/* ========= Fetch helpers ========= */
+async function _fetchJson(url, opts) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { ...(opts || {}), signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally { clearTimeout(timer); }
+}
 async function postApi(path, body) {
   const t0 = performance.now();
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) throw new Error(res.status);
-  return performance.now() - t0;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return performance.now() - t0;
+  } finally { clearTimeout(timer); }
 }
 async function clickAction(r) {
   try {
-    const ms = await postApi("/api/click", {action: r.key, telegram: TELEGRAM_ID, match: matchLabel()});
+    const ms = await postApi("/api/click", { action: r.key, telegram: TELEGRAM_ID, match: matchLabel() });
     setBar("barClick", ms);
     log(`clicked on <span class="hl" style="${r.hl}">${esc(r.key)}</span> on ${esc(matchLabel())}`);
   } catch (e) {
-    log(`# ERROR click "${r.key}" failed`, true);
+    log(`# ERROR click "${esc(r.key)}" failed: ${esc(e.message)}`, true);
   }
 }
 
 /* ========= Fixtures ========= */
 let _warnedEmpty = false;
+let _lastFixtureKeys = "";
+
 async function loadFixtures(quiet) {
   try {
-    const res = await fetch(`${API_BASE}/api/matches`);
-    const result = await res.json();
+    const result = await _fetchJson(`${API_BASE}/api/matches`);
     let matches = [];
     if (result.data && result.data.matches) matches = result.data.matches;
     else if (result.matches) matches = result.matches;
@@ -173,15 +196,31 @@ async function loadFixtures(quiet) {
     else if (result.data && Array.isArray(result.data)) matches = result.data;
 
     if (matches.length > 0) {
-      renderMatches(matches);
-      if (!quiet) log(`Loaded ${matches.length} matches into fixtures.`);
+      const keys = matches.map(m => String(m.key || m.id || "")).join(",");
+      if (keys !== _lastFixtureKeys) {
+        renderMatches(matches);
+        _lastFixtureKeys = keys;
+        if (!quiet) log(`Loaded ${matches.length} matches into fixtures.`);
+      }
       _warnedEmpty = false;
+      _evictMatchCaches(matches);
     } else if (!_warnedEmpty) {
       _warnedEmpty = true;
-      log("# Fixture khali: push/REST theke data asheni");
+      log("# Fixture empty: no data from push/REST yet");
     }
   } catch (err) {
-    log("# Error fetching matches fixture", true);
+    log(`# Error fetching fixtures: ${esc(err.message)}`, true);
+  }
+}
+
+function _evictMatchCaches(matches) {
+  const keep = new Set(matches.map(m => String(m.key || m.id || "")));
+  keep.add(S.matchKey);
+  [MS, TEAMS, STATUS, START].forEach(store => {
+    Object.keys(store).forEach(k => { if (!keep.has(k)) delete store[k]; });
+  });
+  if (Object.keys(MS).length > MAX_CACHED_MATCHES) {
+    Object.keys(MS).forEach(k => { if (k !== S.matchKey) delete MS[k]; });
   }
 }
 
@@ -190,7 +229,6 @@ function renderMatches(matches) {
   if (!tbody) return;
   const order = { started: 0, not_started: 1, completed: 2, cancelled: 3 };
   matches = [...matches].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
-
   const scrollTop = tbody.parentElement ? tbody.parentElement.scrollTop : 0;
 
   let html = "";
@@ -205,9 +243,7 @@ function renderMatches(matches) {
     if (m.start_at) START[matchId] = m.start_at;
     const [stTxt, stCol] = statusView(status);
     const isActive = S.matchKey === matchId;
-    const rowStyle = isActive
-      ? "cursor:pointer;background:rgba(23,240,224,.08)"
-      : "cursor:pointer";
+    const rowStyle = isActive ? "cursor:pointer;background:rgba(23,240,224,.08)" : "cursor:pointer";
 
     html += `<tr style="${rowStyle}" data-key="${esc(matchId)}" data-title="${esc(title)}" data-type="${esc(format)}" data-status="${esc(status)}">
       <td><code>${esc(matchId)}</code></td>
@@ -232,6 +268,8 @@ function selectMatch(key, title, type) {
   st0.dots = []; st0.dotsOver = null; st0.order = null; st0.seen.clear();
   st0.objTs = 0; st0.lastCommId = null; st0.evAt = 0;
   st0.curOv = null; st0.curBall = null;
+  st0.has = false; st0.runs = 0; st0.wk = 0; st0.ov = "0.0"; st0.bat = null;
+  st0.result = ""; st0.toss = ""; st0.brk = ""; st0.sum = []; st0.phase = "cold";
   if (st0._dismissTimer) { clearTimeout(st0._dismissTimer); st0._dismissTimer = null; }
   S.isFreeHitNext = false;
   if ($("matchKey")) $("matchKey").value = key;
@@ -244,15 +282,11 @@ function selectMatch(key, title, type) {
   resetViewport();
   showStatus(key);
   sendWatch();
-  const st = ms(key);
   renderLive(key);
   fetchBaseline(key, 0);
   document.querySelectorAll("#fixture tr").forEach(tr => {
-    if (tr.dataset.key === key) {
-      tr.style.background = "rgba(23,240,224,.08)";
-    } else if (tr.style.background && tr.style.background.includes("rgba(23,240,224")) {
-      tr.style.background = "";
-    }
+    if (tr.dataset.key === key) tr.style.background = "rgba(23,240,224,.08)";
+    else if (tr.style.background && tr.style.background.includes("rgba(23,240,224")) tr.style.background = "";
   });
 }
 
@@ -275,70 +309,60 @@ function loadSettings() {
     setFormLocked(true);
   } catch (e) {}
 }
-$("adminForm")?.addEventListener("submit", e => {
-  e.preventDefault();
-  let ok = true;
-  FORM_FIELDS.forEach(id => {
-    const el = $(id);
-    if (!el) return;
-    const empty = !el.value.trim();
-    el.classList.toggle("need", empty);
-    if (empty) ok = false;
-  });
-  if (!ok) { log("# Please fill all required fields.", true); return; }
-  const data = {};
-  FORM_FIELDS.forEach(id => { data[id] = $(id).value.trim(); });
-  saveSettings(data);
-  setFormLocked(true);
-  log("Settings saved.");
-});
-document.querySelector('[data-edit="adminForm"]')?.addEventListener("click", () => {
-  setFormLocked(false);
-  log("# Edit mode enabled.");
-});
-FORM_FIELDS.forEach(id => $(id)?.addEventListener("input", () => $(id).classList.remove("need")));
-
-function setActive(on) {
-  const b = $("activeBtn");
-  if (!b) return;
-  S.active = !!on;
-  b.classList.toggle("on", !!on);
-  b.textContent = on ? "ACTIVE MATCH" : "NO ACTIVE MATCH";
-}
 
 /* ========= WebSocket ========= */
 function sendWatch() {
   if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send("watch:" + (S.matchKey || ""));
 }
+
+function _handleRawMessage(raw) {
+  if (raw === "pong") return;
+  let m;
+  try { m = JSON.parse(raw); }
+  catch { log("# Data parse error", true); return; }
+
+  if (m.t === "reset") {
+    log(`# reset ${esc(String(m.from || ""))} -> ${esc(String(m.to || ""))}`);
+    return;
+  }
+  if (S.matchKey && m.id && String(m.id) !== S.matchKey) return;
+
+  let delay = 10;
+  if (m._server_ts) delay = Math.max(1, Math.round(Date.now() - m._server_ts));
+
+  updateViewport(m);
+  setBar("barOdds", delay);
+  if (typeof m._lag_ms === "number") pieOnFast(m._lag_ms, delay);
+}
+
 function startLiveListener() {
-  if (S.ws) { S.ws.onclose = null; S.ws.close(); }
+  if (S.ws) { S.ws.onclose = null; try { S.ws.close(); } catch (e) {} }
   clearInterval(S.ping);
   clearTimeout(S.reconnect);
 
   S.ws = new WebSocket(WS_URL);
+  S.ws.binaryType = "arraybuffer";
 
   S.ws.onopen = () => {
     log("# WebSocket connected.");
     clearInterval(S.ping);
     S.ping = setInterval(() => {
       if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send("ping");
-    }, 30000);
+    }, PING_INTERVAL_MS);
     sendWatch();
   };
 
   S.ws.onmessage = (event) => {
-    if (event.data === "pong") return;
-    try {
-      const m = JSON.parse(event.data);
-      if (S.matchKey && m.id && String(m.id) !== S.matchKey) return;
-      let delay = 10;
-      if (m._server_ts) delay = Math.max(1, Math.round(Date.now() - m._server_ts));
-
-      updateViewport(m);
-      setBar("barOdds", delay);
-      if (typeof m._lag_ms === "number") pieOnFast(m._lag_ms, delay);
-    } catch (err) {
-      log("# Data parse error", true);
+    const d = event.data;
+    if (typeof d === "string") { _handleRawMessage(d); return; }
+    if (d instanceof ArrayBuffer) {
+      try { _handleRawMessage(_dec.decode(d)); }
+      catch { log("# binary decode error", true); }
+      return;
+    }
+    if (d instanceof Blob) {
+      d.text().then(_handleRawMessage).catch(() => log("# blob decode error", true));
+      return;
     }
   };
 
@@ -346,15 +370,19 @@ function startLiveListener() {
   S.ws.onclose = () => {
     clearInterval(S.ping);
     log("# WebSocket Disconnected");
-    if (S.started) S.reconnect = setTimeout(startLiveListener, RECONNECT_MS);
+    if (S.started) {
+      const jitter = RECONNECT_MS * (0.7 + Math.random() * RECONNECT_JITTER);
+      S.reconnect = setTimeout(startLiveListener, jitter);
+    }
   };
 }
+
 function stopLiveListener() {
   clearInterval(S.ping);
   clearTimeout(S.reconnect);
   if (S.ws) {
     S.ws.onclose = null;
-    S.ws.close();
+    try { S.ws.close(); } catch (e) {}
     S.ws = null;
     log("# Live Listener Stopped.");
   }
@@ -398,6 +426,7 @@ function breakLabel(txt, st) {
   }
   return "";
 }
+
 function applyPlayState(m, key) {
   const st = ms(key);
   const dayN = Number(m.day);
@@ -447,33 +476,21 @@ function renderLive(key) {
   const status = STATUS[key] || "started";
 
   if (EL.team) {
-    if (st.has && st.bat) {
-      EL.team.textContent = teams[st.bat] || "--";
-    } else if (status === "not_started") {
-      EL.team.textContent = `${aName} vs ${bName}`;
-    } else {
-      EL.team.textContent = aName !== "Team A" ? `${aName} vs ${bName}` : "--";
-    }
+    if (st.has && st.bat) EL.team.textContent = teams[st.bat] || "--";
+    else if (status === "not_started") EL.team.textContent = `${aName} vs ${bName}`;
+    else EL.team.textContent = aName !== "Team A" ? `${aName} vs ${bName}` : "--";
   }
 
   if (EL.score) {
-    if (st.has) {
-      EL.score.textContent = `${st.runs}-${st.wk}`;
-    } else if (status === "not_started") {
-      EL.score.textContent = "UPCOMING";
-    } else if (status === "completed") {
-      EL.score.textContent = "FINISHED";
-    } else {
-      EL.score.textContent = "--";
-    }
+    if (st.has) EL.score.textContent = `${st.runs}-${st.wk}`;
+    else if (status === "not_started") EL.score.textContent = "UPCOMING";
+    else if (status === "completed") EL.score.textContent = "FINISHED";
+    else EL.score.textContent = "--";
   }
 
   if (EL.overTxt) {
-    if (st.has) {
-      EL.overTxt.textContent = `${st.ov} OVER`;
-    } else {
-      EL.overTxt.textContent = "-- OVER";
-    }
+    if (st.has) EL.overTxt.textContent = `${st.ov} OVER`;
+    else EL.overTxt.textContent = "-- OVER";
   }
 }
 
@@ -481,9 +498,7 @@ function renderLive(key) {
 function paintBall(info) {
   const el = EL.ball;
   if (!el) return;
-  const k = info.idle
-    ? "idle"
-    : `${info.kind || ""}|${info.text}|${_evSeq}`;
+  const k = info.idle ? "idle" : `${info.kind || ""}|${info.text}|${_evSeq}`;
   if (el.dataset.k === k) return;
   if (info.idle && el.dataset.k === "idle") return;
   el.dataset.k = k;
@@ -551,16 +566,12 @@ function setBallIdle() {
   renderBall(S.matchKey);
 }
 function clearBallTimers(st) { (st.timers || []).forEach(clearTimeout); st.timers = []; }
-function later(st, delay, fn) { st.timers.push(setTimeout(fn, delay)); }
 function resetBall() {
   const st = S.matchKey ? ms(S.matchKey) : null;
   if (st) {
     clearBallTimers(st);
     if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
-    st.phase = "cold";
-    st.cur = null;
-    st.curOv = null;
-    st.curBall = null;
+    st.phase = "cold"; st.cur = null; st.curOv = null; st.curBall = null;
   }
   setBallIdle();
 }
@@ -578,6 +589,15 @@ function dotEntry(info, legal) {
   }
   return { t, c, legal };
 }
+
+// Stable ID for chip entries. Legal balls use position (unique per over).
+// Illegal balls (wide/no-ball) don't consume positions, so include event key.
+function makeDotId(ovIdx, ballNo, legal, codeOrKey) {
+  if (legal) return `p${ovIdx}.${ballNo}`;
+  const key = String(codeOrKey || "").replace(/\s+/g, "_").slice(0, 24);
+  return `p${ovIdx}.${ballNo}_${key || Math.random().toString(36).slice(2, 10)}`;
+}
+
 function ordinal(n) {
   const v = n % 100;
   if (v >= 11 && v <= 13) return n + "th";
@@ -596,9 +616,9 @@ function renderDots(key) {
   const el = EL.overDots;
   if (!el) return;
   const dots = key && isLiveKey(key) ? ms(key).dots : [];
-  const legal = dots.filter(x => x.legal).length;
+  const legalCount = dots.filter(x => x.legal).length;
   let h = dots.map(x => `<span class="od ${x.c}">${esc(x.t)}</span>`).join("");
-  for (let i = legal; i < 6; i++) h += `<span class="od e">&middot;</span>`;
+  for (let i = legalCount; i < 6; i++) h += `<span class="od e">&middot;</span>`;
   if (el.dataset.h !== h) { el.dataset.h = h; el.innerHTML = h; }
 }
 
@@ -624,7 +644,6 @@ function resultFromEvent(low, ev) {
   return null;
 }
 
-/* ========= Wicket helper ========= */
 function wicketLabel(t) {
   const s = t ? String(t).replace(/[_-]+/g, " ").trim().toUpperCase() : "";
   if (s === "RUNOUT") return "RUN OUT";
@@ -633,50 +652,47 @@ function wicketLabel(t) {
   return s;
 }
 
-/* ========= Classification ========= */
 function classifyEvent(ev) {
   const low = ev.toLowerCase().trim();
-
-  if (/^ball\b/i.test(low) && /\b(chalu|start|chalo|shuru|shuro)\b/i.test(low)) {
-    return { idle: true };
-  }
-
+  if (/^ball\b/i.test(low) && /\b(chalu|start|chalo|shuru|shuro)\b/i.test(low)) return { idle: true };
   if (/^confirm(ing)?\b|^checking\b/i.test(low)) return { text: "Confirming", kind: "raw" };
-
   if (/^no[\s_-]?ball|^nb\b/.test(low)) return { text: "NB", kind: "noball" };
-
-  // Dismissal type (Bowled/LBW/...) → W with sub label
   if (DISMISS_RE.test(low)) return { text: "W", kind: "wicket", sub: wicketLabel(ev) };
-
-  // Pure wicket/out/w keyword → W without sub
   if (/^(wicket|out|w)[.!]*$/.test(low)) return { text: "W", kind: "wicket" };
-
   if (/^four/.test(low) || /^4(?:\s+(?:runs?))?[.!]*$/.test(low)) return { text: "4", kind: "four" };
   if (/^six/.test(low) || /^6(?:\s+(?:runs?))?[.!]*$/.test(low)) return { text: "6", kind: "six" };
   if (/^(dot|0)( ball)?[.!]*$/.test(low)) return { text: "0", kind: "raw" };
-
-  if (/^wide/.test(low)) return { text: "Wd", kind: "raw" };
-
+  if (/^wide/.test(low)) return { text: "WIDE", kind: "wide" };
   if (/^leg[\s_-]?bye/.test(low)) return { text: "LB", kind: "raw" };
   if (/^bye/.test(low)) return { text: "B", kind: "raw" };
-
   const num = /^(\d+)(?:\s+(?:runs?))?[.!]*$/.exec(low);
   if (num) return { text: num[1], kind: "raw" };
-
   return { text: ev, kind: "raw" };
 }
 
-/* ========= Wicket chip helper ========= */
-function addWicketToChip(st, rawOv) {
-  const ovIdx = parseInt(rawOv, 10);
-  const ballNo = parseInt(rawOv.split(".")[1], 10);
+// Wicket chip update with fallback when 'over' field is missing.
+// Prevents stale "0" from remaining in chip.
+function addWicketToChip(st, rawOv, rawBall, code) {
+  let ovIdx = null, ballNo = null;
+
+  if (rawOv != null && String(rawOv).includes(".")) {
+    const parts = String(rawOv).split(".");
+    ovIdx = parseInt(parts[0], 10);
+    ballNo = parseInt(parts[1], 10);
+  } else if (rawBall != null) {
+    if (st.dotsOver != null) ovIdx = st.dotsOver;
+    else if (rawOv != null && !isNaN(parseInt(rawOv, 10))) ovIdx = parseInt(rawOv, 10);
+    ballNo = parseInt(rawBall, 10);
+  }
+
   if (isNaN(ovIdx) || isNaN(ballNo)) return;
+
   if (st.dotsOver == null || ovIdx > st.dotsOver) {
     st.dots = [];
     st.dotsOver = ovIdx;
   }
   if (ovIdx === st.dotsOver) {
-    const dotId = `p${rawOv}`;
+    const dotId = makeDotId(ovIdx, ballNo, true, code || "W");
     const existing = st.dots.findIndex(d => d.id === dotId);
     const entry = { id: dotId, ...dotEntry({ text: "W", kind: "wicket" }, true) };
     if (existing >= 0) st.dots[existing] = entry;
@@ -693,21 +709,15 @@ function handleEvent(key, e) {
 
   const info = classifyEvent(ev);
 
-  // Ball Chalu → idle
   if (info.idle) {
     if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
-    st.phase = "wait";
-    st.cur = null;
-    st.curOv = null;
-    st.curBall = null;
-    st.brk = "";
+    st.phase = "wait"; st.cur = null; st.curOv = null; st.curBall = null; st.brk = "";
     renderBall(key);
     return;
   }
 
-  // ───────────── WICKET PATH ─────────────
+  // Wicket path
   if (info.kind === "wicket") {
-    // Already showing "W" with a scheduled follow-up? Then a dismissal type arrival switches instantly
     if (st.cur && st.cur.kind === "wicket" && info.sub) {
       if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
       _evSeq++;
@@ -722,17 +732,28 @@ function handleEvent(key, e) {
     st.brk = "";
 
     const rawOv = e.over != null ? String(e.over) : "";
-    addWicketToChip(st, rawOv);
+    // FIX #5: prefer e.ball, fall back to e.xball (extended ball no.)
+    const ballRef = e.ball != null ? e.ball : e.xball;
+    addWicketToChip(st, rawOv, ballRef, e.code);
 
     st.phase = "result";
     st.cur = { text: "W", kind: "wicket" };
     const ovIdx = parseInt(rawOv, 10);
-    const ballNo = parseInt(rawOv.split(".")[1], 10);
+    const ballNo = rawOv.includes(".")
+      ? parseInt(rawOv.split(".")[1], 10)
+      : (ballRef != null ? parseInt(ballRef, 10) : NaN);
     st.curOv = !isNaN(ovIdx) ? ovIdx : null;
     st.curBall = !isNaN(ballNo) ? ballNo : null;
+
+    // FIX #5: surface batsman_out / striker in the terminal for traceability.
+    if (e.batsman_out) {
+      log(`# out: <b>${esc(e.batsman_out)}</b>${e.bowler ? ` (b ${esc(e.bowler)})` : ""}`);
+    } else if (e.striker) {
+      log(`# wicket :: striker ${esc(e.striker)}${e.bowler ? ` / bowler ${esc(e.bowler)}` : ""}`);
+    }
+
     renderBall(key);
 
-    // Schedule dismissal text only if we have a sub label
     if (info.sub) {
       if (st._dismissTimer) clearTimeout(st._dismissTimer);
       const sub = info.sub;
@@ -748,7 +769,6 @@ function handleEvent(key, e) {
     return;
   }
 
-  // ───────────── NORMAL FAST PATH ─────────────
   if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
 
   _evSeq++;
@@ -757,24 +777,31 @@ function handleEvent(key, e) {
   st.brk = "";
 
   const rawOv = e.over != null ? String(e.over) : "";
+  // FIX #5: prefer e.ball, fall back to e.xball.
+  const ballRef = e.ball != null ? e.ball : e.xball;
   const low = ev.toLowerCase();
   const parsed = resultFromEvent(low, ev);
   const ovIdx = parseInt(rawOv, 10);
-  const ballNo = parseInt(rawOv.split(".")[1], 10);
+  const ballNo = rawOv.includes(".")
+    ? parseInt(rawOv.split(".")[1], 10)
+    : (ballRef != null ? parseInt(ballRef, 10) : NaN);
 
-  if (parsed && parsed.legal && !isNaN(ovIdx) && !isNaN(ballNo)) {
+  // Include wide/no-ball in chip (not just legal balls)
+  if (parsed && !isNaN(ovIdx) && !isNaN(ballNo)) {
     if (st.dotsOver == null || ovIdx > st.dotsOver) {
       st.dots = [];
       st.dotsOver = ovIdx;
     }
     if (ovIdx === st.dotsOver) {
-      const dotId = `p${rawOv}`;
+      const dotId = makeDotId(ovIdx, ballNo, parsed.legal, e.code || ev);
       const existing = st.dots.findIndex(d => d.id === dotId);
+      const entry = { id: dotId, ...dotEntry(parsed.info, parsed.legal) };
       if (existing >= 0) {
-        st.dots[existing] = { id: dotId, ...dotEntry(parsed.info, true) };
+        st.dots[existing] = entry;
         log(`# correction ball ${esc(rawOv)}: "${esc(ev)}"`);
-      } else if (st.dots.filter(x => x.legal).length < ballNo) {
-        st.dots.push({ id: dotId, ...dotEntry(parsed.info, true) });
+      } else {
+        const legalCount = st.dots.filter(x => x.legal).length;
+        if (parsed.legal ? (legalCount < ballNo) : true) st.dots.push(entry);
       }
     }
   }
@@ -788,7 +815,8 @@ function handleEvent(key, e) {
 
 /* ========= Match object handler ========= */
 function newInnings(st) {
-  st.wk = 0; st.runs = 0; st.ov = "0.0";
+  st.wk = 0; st.runs = 0; st.ov = "0.0"; st.has = false;
+  st.result = ""; st.brk = "";
   st.seen.clear(); st.dots = []; st.dotsOver = null; st.lastCommId = null;
   st.curOv = null; st.curBall = null;
   if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
@@ -798,7 +826,10 @@ function newInnings(st) {
 function infoFromComm(e) {
   if (e.w) return { text: "WICKET", kind: "wicket" };
   if (e.nb > 0) return { text: e.bat > 0 ? `NO BALL +${e.bat}` : "NO BALL", kind: "noball" };
-  if (e.wd > 0) { const wr = Math.max(0, e.run - 1); return { text: wr > 0 ? `WIDE +${wr}` : "WIDE", kind: "raw" }; }
+  if (e.wd > 0) {
+    const wr = Math.max(0, e.run - 1);
+    return { text: wr > 0 ? `WIDE +${wr}` : "WIDE", kind: "wide" };
+  }
   if (e.six)  return { text: "6", kind: "six" };
   if (e.four) return { text: "4", kind: "four" };
   if (e.by > 0) return { text: `${e.by}B`, kind: "raw" };
@@ -807,18 +838,36 @@ function infoFromComm(e) {
 }
 const commLegal = e => !(e.wd > 0 || e.nb > 0);
 
+// Commentary applies only when it is AHEAD of the current chip state.
+// This prevents stale commentary from overwriting fresh ball events.
 function applyComm(key, m) {
   const st = ms(key);
-  const list = (m.comm || []).slice().sort((a, b) => Number(a.id) - Number(b.id));
+  // FIX #3: numeric-aware sort with lexicographic fallback for non-numeric IDs.
+  const list = (m.comm || []).slice().sort((a, b) => {
+    const na = Number(a.id), nb = Number(b.id);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
   if (!list.length) return;
 
   const maxOv = Math.max(...list.map(e => e.ov));
-  if (st.dotsOver == null || maxOv >= st.dotsOver) {
+  const commLegalCount = list.filter(e => e.ov === maxOv && commLegal(e)).length;
+  const chipLegalCount = st.dots.filter(x => x.legal).length;
+  const chipOver = st.dotsOver;
+
+  const shouldRebuild = chipOver == null
+    || maxOv > chipOver
+    || (maxOv === chipOver && commLegalCount > chipLegalCount);
+
+  if (shouldRebuild) {
     st.dots = list.filter(e => e.ov === maxOv)
-      .map(e => ({ id: e.id, ord: e.x || 0, ...dotEntry(infoFromComm(e), commLegal(e)) }));
+      .map(e => ({
+        id: makeDotId(e.ov, e.b, commLegal(e), e.id),
+        ord: e.x || 0,
+        ...dotEntry(infoFromComm(e), commLegal(e))
+      }));
     st.dotsOver = maxOv;
 
-    // Same-ball commentary sync (only if not currently showing wicket/dismissal)
     if (st.phase === "result" && st.cur && st.cur.kind !== "raw" && st.cur.kind !== "wicket"
         && st.curOv !== null && st.curBall !== null) {
       const match = list.find(e => e.ov === st.curOv && e.b === st.curBall);
@@ -872,13 +921,9 @@ function applySummary(key, m) {
     if (lm) last = { side, runs: Number(lm[1]), wk: Number(lm[2]), ov: fmtOvers(lm[3]) };
   });
   st.sum = parts;
-
   if (last && !(m.inn > 0 && m.score)) {
-    st.runs = last.runs;
-    st.wk = last.wk;
-    st.ov = last.ov;
-    st.bat = last.side;
-    st.has = true;
+    st.runs = last.runs; st.wk = last.wk; st.ov = last.ov;
+    st.bat = last.side; st.has = true;
   }
 }
 
@@ -963,29 +1008,31 @@ async function fetchBaseline(key, tries) {
   tries = tries || 0;
   if (!S.matchKey || key !== S.matchKey) return;
   if (_baselineTimer) { clearTimeout(_baselineTimer); _baselineTimer = null; }
+  if (_baselineAbort) { _baselineAbort.abort(); _baselineAbort = null; }
+  const ctrl = new AbortController();
+  _baselineAbort = ctrl;
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(`${API_BASE}/api/match/${encodeURIComponent(key)}`);
+    const res = await fetch(`${API_BASE}/api/match/${encodeURIComponent(key)}`, { signal: ctrl.signal });
+    clearTimeout(timer);
     if (!res.ok) {
-      const errMsg = res.status === 404
-        ? `backend cache e nai (REST_TOKEN set koro)`
-        : `backend HTTP ${res.status}`;
+      const errMsg = res.status === 404 ? "backend cache miss (set REST_TOKEN)" : `backend HTTP ${res.status}`;
       log(`# baseline fail: ${errMsg}`, true);
-      if (tries < BASELINE_MAX_TRIES) {
-        _baselineTimer = setTimeout(() => fetchBaseline(key, tries + 1), BASELINE_RETRY_MS);
-      }
+      if (tries < BASELINE_MAX_TRIES) _baselineTimer = setTimeout(() => fetchBaseline(key, tries + 1), BASELINE_RETRY_MS);
       return;
     }
     const json = await res.json();
-    if (!json.data) {
-      log(`# baseline empty for ${esc(key)}`, true);
-      return;
-    }
+    if (!json.data) { log(`# baseline empty for ${esc(key)}`, true); return; }
     if (key === S.matchKey) {
       log(`# baseline loaded (${tries} retries)`);
       handleMatch(key, json.data);
     }
   } catch (e) {
-    log(`# baseline error: ${e.message}`, true);
+    clearTimeout(timer);
+    if (e.name === "AbortError") return;
+    log(`# baseline error: ${esc(e.message)}`, true);
+  } finally {
+    if (_baselineAbort === ctrl) _baselineAbort = null;
   }
 }
 
@@ -998,7 +1045,6 @@ function updateViewport(m) {
     return;
   }
   if (m.id && String(m.id) !== S.matchKey) return;
-
   if (m.t === "ev") handleEvent(S.matchKey, m);
   else if (m.t === "match") handleMatch(S.matchKey, m);
 }
@@ -1017,21 +1063,24 @@ function stopAll() {
   pieOff();
   S.prevMs = null;
   if (_baselineTimer) { clearTimeout(_baselineTimer); _baselineTimer = null; }
+  if (_baselineAbort) { _baselineAbort.abort(); _baselineAbort = null; }
   setActive(false);
   resetBall();
   log("# Live listener stopped.");
 }
 
-$("bStop")?.addEventListener("click", stopAll);
-$("bRestart")?.addEventListener("click", () => { stopAll(); setTimeout(startAll, 300); });
-$("bAuto")?.addEventListener("click", () => {
-  S.auto = !S.auto;
-  $("bAuto").style.background = S.auto ? "var(--cyan)" : "";
-  $("bAuto").style.color = S.auto ? "#000" : "";
-  if (S.auto && !S.started) startAll();
-});
+function setActive(on) {
+  const b = $("activeBtn");
+  if (!b) return;
+  S.active = !!on;
+  b.classList.toggle("on", !!on);
+  b.textContent = on ? "ACTIVE MATCH" : "NO ACTIVE MATCH";
+}
 
+/* ========= Init ========= */
 window.addEventListener("DOMContentLoaded", () => {
+  initRings();
+
   const canvasEl = $("latChart");
   if (canvasEl && window.Chart) {
     chart = new Chart(canvasEl, {
@@ -1040,13 +1089,45 @@ window.addEventListener("DOMContentLoaded", () => {
         labels: ["Latency A", "Latency B"],
         datasets: [{ data: [1, 1], backgroundColor: [GREY, GREY], borderColor: "#fff", borderWidth: 1 }]
       },
-      options: {
-        responsive: false,
-        animation: false,
-        plugins: { legend: { display: false }, tooltip: { enabled: false } }
-      }
+      options: { responsive: false, animation: false, plugins: { legend: { display: false }, tooltip: { enabled: false } } }
     });
   }
+
+  $("adminForm")?.addEventListener("submit", e => {
+    e.preventDefault();
+    let ok = true;
+    FORM_FIELDS.forEach(id => {
+      const el = $(id);
+      if (!el) return;
+      const empty = !el.value.trim();
+      el.classList.toggle("need", empty);
+      if (empty) ok = false;
+    });
+    if (!ok) { log("# Please fill all required fields.", true); return; }
+    const data = {};
+    FORM_FIELDS.forEach(id => { data[id] = $(id).value.trim(); });
+    saveSettings(data);
+    setFormLocked(true);
+    log("Settings saved.");
+  });
+  document.querySelector('[data-edit="adminForm"]')?.addEventListener("click", () => {
+    setFormLocked(false);
+    log("# Edit mode enabled.");
+  });
+  FORM_FIELDS.forEach(id => $(id)?.addEventListener("input", () => $(id).classList.remove("need")));
+
+  $("bStop")?.addEventListener("click", stopAll);
+  $("bRestart")?.addEventListener("click", () => { stopAll(); setTimeout(startAll, 300); });
+  $("bAuto")?.addEventListener("click", () => {
+    S.auto = !S.auto;
+    const btn = $("bAuto");
+    if (btn) {
+      btn.style.background = S.auto ? "var(--cyan)" : "";
+      btn.style.color = S.auto ? "#000" : "";
+    }
+    if (S.auto && !S.started) startAll();
+  });
+
   loadSettings();
   loadFixtures();
   setInterval(() => loadFixtures(true), FIXTURE_POLL_MS);
@@ -1055,6 +1136,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (document.visibilityState === "visible") {
       loadFixtures(true);
       if (_pieData.dirty) _pieRenderNow();
+      if (S.started && (!S.ws || S.ws.readyState !== WebSocket.OPEN)) startLiveListener();
     }
   });
 
