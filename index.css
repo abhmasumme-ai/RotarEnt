@@ -55,31 +55,74 @@ header .ctrl button:hover { background: var(--cyan); color: #000; border-color: 
 }
 .box label { font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-top: 4px; }
 .box label:first-child { margin-top: 0; }
-.box input {
+.box input:not([type="radio"]):not([type="checkbox"]) {
   background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-main); text-transform: uppercase;
   padding: 4px 10px; border-radius: 4px; font-size: 13px; width: 100%; outline: none; transition: border-color .2s;
 }
-.box input:focus { border-color: var(--cyan); }
-.box input:disabled { opacity: .6; cursor: not-allowed; }
-.box .two { display: flex; gap: 10px; }
-.box .two > div { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-
-.active-btn {
-  width: 100%; margin-top: 8px; padding: 5px; border-radius: 4px;
-  border: 1px solid var(--yellow); background: var(--yellow); color: #000;
-  font-weight: bold; font-size: 12px; cursor: default; transition: all .2s;
-}
-.active-btn.on { background: none; color: var(--green); border-color: var(--green); }
+.box input:not([type="radio"]):not([type="checkbox"]):focus { border-color: var(--cyan); }
+.box input:not([type="radio"]):not([type="checkbox"]):disabled { opacity: .6; cursor: not-allowed; }
+.box input.url-input { text-transform: none; }
 .box input[readonly] { cursor: default; }
 
-.btns { display: flex; gap: 10px; margin-top: 8px; }
-.btns button { flex: 1; padding: 5px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; font-size: 12px; transition: opacity .2s; }
+/* Radio-look (checkbox styled as radio) */
+.box input.radio-look {
+  appearance: none; -webkit-appearance: none;
+  width: 18px; height: 18px; flex: none; margin: 0;
+  border: 2px solid var(--border-color); border-radius: 50%;
+  background: var(--bg-primary); cursor: pointer;
+  position: relative; transition: all .2s;
+}
+.box input.radio-look:hover { border-color: var(--cyan); }
+.box input.radio-look:checked { border-color: var(--cyan); }
+.box input.radio-look:checked::after {
+  content: ""; position: absolute; inset: 3px;
+  border-radius: 50%; background: var(--cyan);
+}
+
+/* Active button — green bg, white text default; .on = outlined */
+.active-btn {
+  width: 100%; margin-top: 8px; padding: 5px; border-radius: 4px;
+  border: 1px solid var(--green); background: var(--green); color: #fff;
+  font-weight: bold; font-size: 12px; cursor: pointer; transition: all .2s;
+  letter-spacing: 0.5px; text-transform: uppercase;
+}
+.active-btn:hover:not(.on) { opacity: 0.9; box-shadow: 0 0 8px rgba(22,240,85,.4); }
+.active-btn.on { background: none; color: var(--green); border-color: var(--green); cursor: default; }
+
+/* Option groups (accordion-style) */
+.option-group {
+  display: flex; flex-direction: column; gap: 3px;
+  margin-top: 6px;
+}
+.option-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px;
+}
+.option-row label {
+  font-size: 11px; color: var(--text-muted); font-weight: 600;
+  text-transform: uppercase; margin: 0; flex: 1; cursor: pointer;
+}
+.dropdown {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 8px; margin-top: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+.dropdown[hidden] { display: none !important; }
+.dropdown label {
+  font-size: 11px; color: var(--text-muted); font-weight: 600;
+  text-transform: uppercase; margin: 0;
+}
+
+.btns { display: flex; gap: 6px; margin-top: 6px; }
+.btns button { flex: 1; padding: 5px; border-radius: 4px; border: none; font-weight: bold; cursor: pointer; font-size: 11px; transition: opacity .2s; }
 .btns button.submit { background: var(--cyan); color: #000; }
 .btns button.edit { background: var(--bg-tertiary); color: var(--text-main); border: 1px solid var(--border-color); }
+.btns button.stop { background: var(--red); color: #fff; }
 .btns button:hover:not(:disabled) { opacity: .85; }
 .btns button:disabled { opacity: .35; cursor: not-allowed; }
 input.need { border-color: var(--red) !important; box-shadow: 0 0 5px rgba(255,42,42,.4); }
-#site, #match { text-transform: none; }
 
 .viewport {
   background: var(--bg-secondary); border: 1px solid var(--border-color); border-top: none; padding: 15px 20px;
@@ -90,7 +133,7 @@ input.need { border-color: var(--red) !important; box-shadow: 0 0 5px rgba(255,4
 .team { font-size: 20px; font-weight: bold; text-transform: uppercase; color: var(--text-main); }
 .score { font-size: 26px; font-weight: 700; color: var(--yellow); }
 .over { font-size: 20px; font-weight: 700; color: var(--text-main); margin-top: 4px; letter-spacing: 3px; }
-.status { overflow:hidden; max-height:50px;  font-size: 12px; color: var(--yellow); text-align: right; max-width: 280px; line-height: 1.3; margin-bottom: 8px; border: none !important; }
+.status { overflow:hidden; max-height:50px; font-size: 12px; color: var(--yellow); text-align: right; max-width: 280px; line-height: 1.3; margin-bottom: 8px; border: none !important; }
 
 /* ========= Ball box base ========= */
 .ball {
@@ -102,7 +145,6 @@ input.need { border-color: var(--red) !important; box-shadow: 0 0 5px rgba(255,4
 }
 .ball span { font-size: 30px; font-weight: 700; line-height: 1.1; }
 
-/* idle — Ball.... dots animation */
 .ball.idle { color: var(--cyan); border-color: transparent; }
 .ball.idle span { font-size: 26px; letter-spacing: 1px; }
 .ball.idle i { font-style: normal; animation: dotWave 1.2s infinite; }
@@ -111,104 +153,64 @@ input.need { border-color: var(--red) !important; box-shadow: 0 0 5px rgba(255,4
 .ball.idle i:nth-child(4) { animation-delay: .45s; }
 @keyframes dotWave { 0%, 60%, 100% { opacity: .2; } 30% { opacity: 1; } }
 
-/* ★ Blinking border — W/4/6/NB only (no !important so animation wins) */
 @keyframes borderBlink {
   0%, 100% { border-color: currentColor; }
   50%      { border-color: transparent; }
 }
 
 .ball.four {
-  color: var(--green);
-  background: var(--bg-tertiary);
-  border: 3px solid var(--green);
-  animation: borderBlink .6s ease-in-out infinite;
+  color: var(--green); background: var(--bg-tertiary);
+  border: 3px solid var(--green); animation: borderBlink .6s ease-in-out infinite;
 }
 .ball.four span { font-size: 40px; color: var(--green); }
 
 .ball.six {
-  color: var(--purple);
-  background: var(--bg-tertiary);
-  border: 3px solid var(--purple);
-  animation: borderBlink .6s ease-in-out infinite;
+  color: var(--purple); background: var(--bg-tertiary);
+  border: 3px solid var(--purple); animation: borderBlink .6s ease-in-out infinite;
 }
 .ball.six span { font-size: 40px; color: var(--purple); }
 
 .ball.wicket {
-  color: var(--red);
-  background: var(--bg-tertiary);
-  border: 3px solid var(--red);
-  animation: borderBlink .6s ease-in-out infinite;
+  color: var(--red); background: var(--bg-tertiary);
+  border: 3px solid var(--red); animation: borderBlink .6s ease-in-out infinite;
 }
 .ball.wicket span { font-size: 32px; color: var(--red); }
 
 .ball.noball {
-  color: var(--yellow);
-  background: var(--bg-tertiary);
-  border: 3px solid var(--yellow);
-  animation: borderBlink .6s ease-in-out infinite;
+  color: var(--yellow); background: var(--bg-tertiary);
+  border: 3px solid var(--yellow); animation: borderBlink .6s ease-in-out infinite;
 }
 .ball.noball span { font-size: 22px; color: var(--yellow); }
 
-/* RAW — Ball in Air / Review / dot / wide / etc. */
-.ball.raw {
-  color: #fff;
-  background: var(--bg-tertiary);
-  border-color: transparent;
-  animation: none;
-  transition: none;
-}
+.ball.wide { color: #fff; background: var(--bg-tertiary); border-color: transparent; animation: none; }
+.ball.wide span { font-size: 22px; font-weight: 700; }
+
+.ball.raw { color: #fff; background: var(--bg-tertiary); border-color: transparent; animation: none; transition: none; }
 .ball.raw span {
-  font-size: 22px;
-  font-weight: 700;
-  line-height: 1.15;
-  letter-spacing: 0.3px;
-  color: #fff;
-  animation: none;
-  transition: none;
-  white-space: normal;
-  word-break: break-word;
-  max-width: 260px;
+  font-size: 22px; font-weight: 700; line-height: 1.15; letter-spacing: 0.3px;
+  color: #fff; animation: none; transition: none;
+  white-space: normal; word-break: break-word; max-width: 260px;
 }
 
-/* No-animation plain states */
-.ball.dot, .ball.run {
-  color: #fff;
-  border-color: transparent;
-  animation: none;
-}
-.ball.dot span, .ball.run span { font-size: 40px; }
+/* DOT — same background as RUN (inherits .ball bg), no border, no animation */
+.ball.dot { color: #fff; border-color: transparent; animation: none; }
+.ball.dot span { font-size: 40px; }
 
-.ball.msg {
-  color: var(--yellow);
-  border-color: transparent;
-  animation: none;
-}
+.ball.run { color: #fff; border-color: transparent; animation: none; }
+.ball.run span { font-size: 40px; }
+
+.ball.msg { color: var(--yellow); border-color: transparent; animation: none; }
 .ball.msg span { font-size: 15px; line-height: 1.35; }
 
-.ball.overdone {
-  color: var(--cyan);
-  background: var(--bg-tertiary);
-  border: 3px solid var(--cyan);
-  animation: none;
-}
+.ball.overdone { color: var(--cyan); background: var(--bg-tertiary); border: 3px solid var(--cyan); animation: none; }
 .ball.overdone span { font-size: 20px; font-weight: 800; letter-spacing: .5px; }
 
-.ball.freehit {
-  color: #fff;
-  background: var(--bg-tertiary);
-  border: 3px solid #fff;
-  animation: none;
-}
+.ball.freehit { color: #fff; background: var(--bg-tertiary); border: 3px solid #fff; animation: none; }
 .ball.freehit span { font-size: 30px; }
 
-.ball.brk {
-  color: var(--yellow);
-  border-color: transparent;
-  animation: none;
-}
+.ball.brk { color: var(--yellow); border-color: transparent; animation: none; }
 .ball.brk span { font-size: 20px; line-height: 1.3; }
 
-/* vp-right layout */
 .vp-right { flex: 0 1 290px; min-width: 200px; align-self: stretch; contain: size; display: flex; flex-direction: column; gap: 4px; margin-left: auto; }
 .vp-right .status { margin-bottom: 0; flex: none; max-width: 100%; }
 .vp-right .status:empty { display: none; }
@@ -226,7 +228,7 @@ input.need { border-color: var(--red) !important; box-shadow: 0 0 5px rgba(255,4
   font-size: 11px; font-weight: 700; color: var(--text-main);
   background: var(--bg-tertiary); border: 1px solid var(--border-color);
 }
-.od.d { color: var(--text-muted); }
+.od.d { background: #fff; color: #000; }
 .od.f { background: var(--green); border-color: var(--green); color: #000; }
 .od.s { background: var(--purple); border-color: var(--purple); color: #000; }
 .od.w { background: var(--red); border-color: var(--red); color: #000; }
@@ -235,8 +237,7 @@ input.need { border-color: var(--red) !important; box-shadow: 0 0 5px rgba(255,4
 
 .table-container {
   background: var(--bg-secondary); border: 1px solid var(--border-color); border-top: none;
-  border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
-  overflow-y: auto;
+  border-bottom-left-radius: 6px; border-bottom-right-radius: 6px; overflow-y: auto;
 }
 table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
 th, td { padding: 6px 12px; border-bottom: 1px solid var(--border-color); }
@@ -246,8 +247,8 @@ tbody tr:hover { background: rgba(23,240,224,.05); }
 .terminal {
   background: var(--bg-secondary); border: 1px solid var(--border-color); border-top: none;
   border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
-  overflow-y: auto;
-  padding: 10px; list-style: none; font-family: monospace; font-size: 11px; color: var(--text-muted);
+  overflow-y: auto; padding: 10px; list-style: none;
+  font-family: monospace; font-size: 11px; color: var(--text-muted);
 }
 .terminal li { margin-bottom: 4px; }
 .terminal li.err { color: var(--red); }
