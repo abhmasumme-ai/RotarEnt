@@ -16,7 +16,6 @@ const RECONNECT_MS = 3000;
 const RECONNECT_JITTER = 0.6;
 const SETTINGS_KEY = "cricketPanelSettings";
 const FALLBACK_QUIET_MS = 8000;
-const PIE_MIN_MS = 200;
 const FIXTURE_POLL_MS = 15000;
 const BASELINE_RETRY_MS = 3000;
 const BASELINE_MAX_TRIES = 5;
@@ -40,9 +39,10 @@ const EL = {
 
 const S = {
   started: false, ws: null, ping: null, reconnect: null,
-  prevMs: null, label: "", matchKey: "", active: true, auto: false, idle: true,
+  prevMs: null, label: "", matchKey: "", active: false, auto: false, idle: true,
   fmt: "", cur: null, isFreeHitNext: false, unk: new Set(),
   oversOverride: OVERS_OVERRIDE,
+  pendingKey: "", pendingLabel: "", pendingFmt: "",
 };
 
 let _evSeq = 0;
@@ -64,7 +64,7 @@ function log(msg, err) {
   if (atBottom) t.scrollTop = t.scrollHeight;
 }
 function matchLabel() {
-  return S.label || EL.score?.parentElement?.textContent || "match";
+  return S.label || "match";
 }
 
 /* ========= Bars ========= */
@@ -82,47 +82,57 @@ function setBar(id, ms) {
   }
 }
 
-/* ========= Pie chart ========= */
+/* ========= Pie chart (v2.7: rAF-deferred, pie does NOT delay viewport) ========= */
 const GREY = "#555";
 let chart = null;
+
 function setPie(vals, cols) {
   if (!chart) return;
-  chart.data.datasets[0].data = vals;
-  chart.data.datasets[0].backgroundColor = cols;
-  chart.update("none");
+  try {
+    chart.data.datasets[0].data = vals;
+    chart.data.datasets[0].backgroundColor = cols;
+    chart.update("none");
+  } catch (e) {}
 }
+
 let _pieData = { r: 0, b: 0, dirty: false };
-let _pieTimer = 0;
+let _pieRaf = 0;
 let _pieLastMs = 0;
 
 function pieOff() {
   _pieData = { r: 0, b: 0, dirty: false };
-  if (_pieTimer) { clearTimeout(_pieTimer); _pieTimer = 0; }
+  if (_pieRaf) { cancelAnimationFrame(_pieRaf); _pieRaf = 0; }
   setPie([1, 1], [GREY, GREY]);
   if (EL.lgR) EL.lgR.textContent = "0ms";
   if (EL.lgB) EL.lgB.textContent = "0ms";
 }
+
 function _pieRenderNow() {
-  _pieTimer = 0;
+  _pieRaf = 0;
   if (!_pieData.dirty) return;
-  _pieData.dirty = false;
-  _pieLastMs = performance.now();
   if (!chart) return;
   if (document.visibilityState !== "visible") return;
+  _pieData.dirty = false;
+  _pieLastMs = performance.now();
   const r = Math.min(Math.max(0, _pieData.r), MAX_MS) || 1;
   const b = Math.min(Math.max(0, _pieData.b), MAX_MS) || 1;
   setPie([r, b], ["#ff2a2a", "#17f0e0"]);
 }
+
+function _pieScheduleRaf() {
+  if (_pieRaf) return;
+  _pieRaf = requestAnimationFrame(_pieRenderNow);
+}
+
 function pieOnFast(r, b) {
   _pieData.r = Math.max(0, r);
   _pieData.b = Math.max(0, b);
   _pieData.dirty = true;
+  // text labels update NOW (cheap) so user sees numbers instantly
   if (EL.lgR) EL.lgR.textContent = Math.round(_pieData.r) + "ms";
   if (EL.lgB) EL.lgB.textContent = Math.round(_pieData.b) + "ms";
-  const now = performance.now();
-  const wait = Math.max(0, PIE_MIN_MS - (now - _pieLastMs));
-  if (wait === 0) _pieRenderNow();
-  else if (!_pieTimer) _pieTimer = setTimeout(_pieRenderNow, wait);
+  // chart canvas redraw deferred to next frame → viewport paint finishes first
+  _pieScheduleRaf();
 }
 
 /* ========= Rings ========= */
@@ -216,11 +226,12 @@ async function loadFixtures(quiet) {
 function _evictMatchCaches(matches) {
   const keep = new Set(matches.map(m => String(m.key || m.id || "")));
   keep.add(S.matchKey);
+  keep.add(S.pendingKey);
   [MS, TEAMS, STATUS, START].forEach(store => {
     Object.keys(store).forEach(k => { if (!keep.has(k)) delete store[k]; });
   });
   if (Object.keys(MS).length > MAX_CACHED_MATCHES) {
-    Object.keys(MS).forEach(k => { if (k !== S.matchKey) delete MS[k]; });
+    Object.keys(MS).forEach(k => { if (k !== S.matchKey && k !== S.pendingKey) delete MS[k]; });
   }
 }
 
@@ -242,7 +253,7 @@ function renderMatches(matches) {
     STATUS[matchId] = status;
     if (m.start_at) START[matchId] = m.start_at;
     const [stTxt, stCol] = statusView(status);
-    const isActive = S.matchKey === matchId;
+    const isActive = S.matchKey === matchId || S.pendingKey === matchId;
     const rowStyle = isActive ? "cursor:pointer;background:rgba(23,240,224,.08)" : "cursor:pointer";
 
     html += `<tr style="${rowStyle}" data-key="${esc(matchId)}" data-title="${esc(title)}" data-type="${esc(format)}" data-status="${esc(status)}">
@@ -260,54 +271,87 @@ function renderMatches(matches) {
   );
 }
 
-function selectMatch(key, title, type) {
-  S.matchKey = key;
-  S.label = title;
-  S.fmt = type || "";
-  const st0 = ms(key);
-  st0.dots = []; st0.dotsOver = null; st0.order = null; st0.seen.clear();
-  st0.objTs = 0; st0.lastCommId = null; st0.evAt = 0;
-  st0.curOv = null; st0.curBall = null;
-  st0.has = false; st0.runs = 0; st0.wk = 0; st0.ov = "0.0"; st0.bat = null;
-  st0.result = ""; st0.toss = ""; st0.brk = ""; st0.sum = []; st0.phase = "cold";
-  if (st0._dismissTimer) { clearTimeout(st0._dismissTimer); st0._dismissTimer = null; }
-  S.isFreeHitNext = false;
-  if ($("matchKey")) $("matchKey").value = key;
-  if ($("type")) $("type").value = type || "";
-  if ($("matchTeams")) $("matchTeams").textContent = title;
-  log(`Selected match: ${esc(title)}`);
-  resetBall();
-  startAll();
-  setActive(true);
-  resetViewport();
-  showStatus(key);
-  sendWatch();
-  renderLive(key);
-  fetchBaseline(key, 0);
+function highlightFixtureRow(key) {
   document.querySelectorAll("#fixture tr").forEach(tr => {
     if (tr.dataset.key === key) tr.style.background = "rgba(23,240,224,.08)";
     else if (tr.style.background && tr.style.background.includes("rgba(23,240,224")) tr.style.background = "";
   });
 }
 
-/* ========= Admin form ========= */
-const FORM_FIELDS = ["site", "match", "over05", "under05", "over23", "b46", "bat", "wk"];
-function setFormLocked(locked) {
-  FORM_FIELDS.forEach(id => { if ($(id)) $(id).disabled = locked; });
-  const sub = document.querySelector("#adminForm .submit");
-  if (sub) sub.disabled = locked;
+/* ========= Viewport blank state ========= */
+function blankViewport() {
+  if (EL.score) EL.score.textContent = "--";
+  if (EL.overTxt) EL.overTxt.textContent = "-- OVER";
+  if (EL.team) EL.team.textContent = "--";
+  if ($("matchTeams")) $("matchTeams").textContent = "-- vs --";
+  if (EL.status) EL.status.textContent = "Click ACTIVE to load";
+  if (EL.overNo) EL.overNo.textContent = "-- OVER";
+  if (EL.overDots) { EL.overDots.dataset.h = ""; EL.overDots.innerHTML = ""; }
+  paintBall({ text: "--", kind: "msg" });
 }
-function saveSettings(data) {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(data)); } catch (e) {}
+
+/* ========= Match selection / activation ========= */
+function selectMatch(key, title, type) {
+  S.pendingKey = key;
+  S.pendingLabel = title;
+  S.pendingFmt = type || "";
+
+  if ($("matchKey")) $("matchKey").value = key;
+  if ($("type")) $("type").value = type || "";
+
+  if (S.matchKey === key && S.active) {
+    log(`Selected: ${esc(title)} (already active)`);
+    highlightFixtureRow(key);
+    return;
+  }
+
+  S.matchKey = "";
+  S.label = "";
+  S.fmt = "";
+  S.active = false;
+  setActive(false);
+  sendWatch();
+  resetBall();
+  blankViewport();
+
+  log(`Selected: ${esc(title)} — click ACTIVE to load`);
+  highlightFixtureRow(key);
 }
-function loadSettings() {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return;
-    const data = JSON.parse(raw);
-    FORM_FIELDS.forEach(id => { if ($(id) && data[id] !== undefined) $(id).value = data[id]; });
-    setFormLocked(true);
-  } catch (e) {}
+
+function activateMatch() {
+  if (!S.pendingKey) {
+    log("# Select a match from Fixture first", true);
+    return;
+  }
+  if (S.active && S.matchKey === S.pendingKey) {
+    log("# Already active for this match");
+    return;
+  }
+
+  S.matchKey = S.pendingKey;
+  S.label = S.pendingLabel;
+  S.fmt = S.pendingFmt;
+
+  const st = ms(S.matchKey);
+  st.dots = []; st.dotsOver = null; st.order = null; st.seen.clear();
+  st.objTs = 0; st.lastCommId = null; st.evAt = 0;
+  st.has = false; st.runs = 0; st.wk = 0; st.ov = "0.0"; st.bat = null;
+  st.result = ""; st.toss = ""; st.brk = ""; st.sum = [];
+  st.day = null; st.session = null; st.dayLine = ""; st.rawState = ""; st.maxOv = 0;
+  if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
+  S.isFreeHitNext = false;
+
+  if ($("matchTeams")) $("matchTeams").textContent = S.label;
+
+  resetBall();
+  startAll();
+  setActive(true);
+  resetViewport();
+  showStatus(S.matchKey);
+  sendWatch();
+  renderLive(S.matchKey);
+  fetchBaseline(S.matchKey, 0);
+  log(`Activated: ${esc(S.label)}`);
 }
 
 /* ========= WebSocket ========= */
@@ -330,9 +374,15 @@ function _handleRawMessage(raw) {
   let delay = 10;
   if (m._server_ts) delay = Math.max(1, Math.round(Date.now() - m._server_ts));
 
+  // 1️⃣ Viewport FIRST — synchronous, fast, never blocked by pie
   updateViewport(m);
   setBar("barOdds", delay);
-  if (typeof m._lag_ms === "number") pieOnFast(m._lag_ms, delay);
+
+  // 2️⃣ Pie AFTER — only for messages that carry a real entity→main.py lag
+  if (typeof m._lag_ms === "number") {
+    pieOnFast(m._lag_ms, delay);
+  }
+  // Baseline (no _lag_ms): pie untouched — cold data, not a live lag
 }
 
 function startLiveListener() {
@@ -505,6 +555,8 @@ function paintBall(info) {
   S.cur = info;
 
   el.style.animation = "none";
+  el.style.background = "";
+  el.style.color = "";
 
   if (info.idle) {
     el.className = "ball idle";
@@ -562,7 +614,7 @@ function renderBall(key) {
   renderDots(key);
 }
 function setBallIdle() {
-  if (!S.matchKey) { paintBall({ text: "NULL", kind: "msg" }); renderDots(null); return; }
+  if (!S.matchKey) { paintBall({ text: "--", kind: "msg" }); renderDots(null); return; }
   renderBall(S.matchKey);
 }
 function clearBallTimers(st) { (st.timers || []).forEach(clearTimeout); st.timers = []; }
@@ -578,22 +630,25 @@ function resetBall() {
 
 /* ========= Over dots ========= */
 function dotEntry(info, legal) {
-  let t = info.text, c = "r";
+  let t = info.chipText || info.text, c = "r";
   switch (info.kind) {
-    case "wicket":  t = "W"; c = "w"; break;
+    case "wicket":  t = info.chipText || "W"; c = "w"; break;
     case "six":     t = "6"; c = "s"; break;
     case "four":    t = "4"; c = "f"; break;
     case "noball":  t = "NB"; c = "x"; break;
     case "wide":    t = "WD"; c = "x"; break;
     case "dot":     t = "0"; c = "d"; break;
+    case "raw":
+      if (String(info.text) === "0") { t = "0"; c = "d"; }
+      break;
   }
   return { t, c, legal };
 }
 
-// Stable ID for chip entries. Legal balls use position (unique per over).
-// Illegal balls (wide/no-ball) don't consume positions, so include event key.
-function makeDotId(ovIdx, ballNo, legal, codeOrKey) {
+function makeDotId(ovIdx, ballNo, legal, codeOrKey, xballNo) {
   if (legal) return `p${ovIdx}.${ballNo}`;
+  const xb = Number(xballNo);
+  if (!isNaN(xb) && xb > 0) return `p${ovIdx}.x${xb}`;
   const key = String(codeOrKey || "").replace(/\s+/g, "_").slice(0, 24);
   return `p${ovIdx}.${ballNo}_${key || Math.random().toString(36).slice(2, 10)}`;
 }
@@ -625,6 +680,11 @@ function renderDots(key) {
 /* ========= Parser ========= */
 const DISMISS_RE = /^(bowled|lbw|caught|c ?& ?b|caught behind|caught and bowled|run ?out|stumped?|hit ?wicket|retired|handled|obstruct|timed ?out|hit the ball twice)/i;
 
+function wicketChipText(e) {
+  const r = Number(e.run) || 0;
+  return r > 0 ? `W+${r}` : "W";
+}
+
 function resultFromEvent(low, ev) {
   if (/^(dot|0)( ball)?[.!]*$/.test(low)) return { legal: true, info: { text: "0", kind: "dot" } };
   const num = /^(\d+)(?:\s+(?:runs?))?[.!]*$/.exec(low);
@@ -640,7 +700,16 @@ function resultFromEvent(low, ev) {
   if (DISMISS_RE.test(low)) return { legal: true, info: { text: "W", kind: "wicket" } };
   if (/^wide/.test(low)) return { legal: false, info: { text: "WD", kind: "wide" } };
   if (/^no[\s_-]?ball|^nb\b/.test(low)) return { legal: false, info: { text: "NB", kind: "noball" } };
-  if (/^leg[\s_-]?bye/.test(low) || /^bye/.test(low)) return { legal: true, info: { text: ev.toUpperCase(), kind: "run" } };
+  if (/^leg[\s_-]?bye/i.test(low)) {
+    const m = /(\d+)/.exec(ev);
+    const cnt = m ? m[1] : "1";
+    return { legal: true, info: { text: "legbye", kind: "raw", chipText: `${cnt}LB` } };
+  }
+  if (/^bye/i.test(low)) {
+    const m = /(\d+)/.exec(ev);
+    const cnt = m ? m[1] : "1";
+    return { legal: true, info: { text: "bye", kind: "raw", chipText: `${cnt}B` } };
+  }
   return null;
 }
 
@@ -661,18 +730,16 @@ function classifyEvent(ev) {
   if (/^(wicket|out|w)[.!]*$/.test(low)) return { text: "W", kind: "wicket" };
   if (/^four/.test(low) || /^4(?:\s+(?:runs?))?[.!]*$/.test(low)) return { text: "4", kind: "four" };
   if (/^six/.test(low) || /^6(?:\s+(?:runs?))?[.!]*$/.test(low)) return { text: "6", kind: "six" };
-  if (/^(dot|0)( ball)?[.!]*$/.test(low)) return { text: "0", kind: "raw" };
+  if (/^(dot|0)( ball)?[.!]*$/.test(low)) return { text: "0", kind: "dot" };
   if (/^wide/.test(low)) return { text: "WIDE", kind: "wide" };
-  if (/^leg[\s_-]?bye/.test(low)) return { text: "LB", kind: "raw" };
-  if (/^bye/.test(low)) return { text: "B", kind: "raw" };
+  if (/^leg[\s_-]?bye/i.test(low)) return { text: "legbye", kind: "raw" };
+  if (/^bye/i.test(low)) return { text: "bye", kind: "raw" };
   const num = /^(\d+)(?:\s+(?:runs?))?[.!]*$/.exec(low);
   if (num) return { text: num[1], kind: "raw" };
   return { text: ev, kind: "raw" };
 }
 
-// Wicket chip update with fallback when 'over' field is missing.
-// Prevents stale "0" from remaining in chip.
-function addWicketToChip(st, rawOv, rawBall, code) {
+function addWicketToChip(st, rawOv, rawBall, code, xballNo) {
   let ovIdx = null, ballNo = null;
 
   if (rawOv != null && String(rawOv).includes(".")) {
@@ -692,11 +759,26 @@ function addWicketToChip(st, rawOv, rawBall, code) {
     st.dotsOver = ovIdx;
   }
   if (ovIdx === st.dotsOver) {
-    const dotId = makeDotId(ovIdx, ballNo, true, code || "W");
+    const dotId = makeDotId(ovIdx, ballNo, true, code || "W", xballNo);
     const existing = st.dots.findIndex(d => d.id === dotId);
-    const entry = { id: dotId, ...dotEntry({ text: "W", kind: "wicket" }, true) };
-    if (existing >= 0) st.dots[existing] = entry;
-    else if (st.dots.filter(x => x.legal).length < ballNo) st.dots.push(entry);
+    const entry = { id: dotId, ballNo, xball: xballNo, ...dotEntry({ text: "W", kind: "wicket" }, true) };
+    if (existing >= 0) {
+      st.dots[existing] = entry;
+    } else {
+      const legalCount = st.dots.filter(x => x.legal).length;
+      if (legalCount < ballNo) {
+        st.dots.push(entry);
+      } else {
+        let seen = 0, replaced = false;
+        for (let i = 0; i < st.dots.length; i++) {
+          if (st.dots[i].legal) {
+            seen++;
+            if (seen === ballNo) { st.dots[i] = entry; replaced = true; break; }
+          }
+        }
+        if (!replaced) st.dots.push(entry);
+      }
+    }
   }
 }
 
@@ -716,7 +798,6 @@ function handleEvent(key, e) {
     return;
   }
 
-  // Wicket path
   if (info.kind === "wicket") {
     if (st.cur && st.cur.kind === "wicket" && info.sub) {
       if (st._dismissTimer) { clearTimeout(st._dismissTimer); st._dismissTimer = null; }
@@ -732,9 +813,8 @@ function handleEvent(key, e) {
     st.brk = "";
 
     const rawOv = e.over != null ? String(e.over) : "";
-    // FIX #5: prefer e.ball, fall back to e.xball (extended ball no.)
     const ballRef = e.ball != null ? e.ball : e.xball;
-    addWicketToChip(st, rawOv, ballRef, e.code);
+    addWicketToChip(st, rawOv, ballRef, e.code, e.xball);
 
     st.phase = "result";
     st.cur = { text: "W", kind: "wicket" };
@@ -745,7 +825,6 @@ function handleEvent(key, e) {
     st.curOv = !isNaN(ovIdx) ? ovIdx : null;
     st.curBall = !isNaN(ballNo) ? ballNo : null;
 
-    // FIX #5: surface batsman_out / striker in the terminal for traceability.
     if (e.batsman_out) {
       log(`# out: <b>${esc(e.batsman_out)}</b>${e.bowler ? ` (b ${esc(e.bowler)})` : ""}`);
     } else if (e.striker) {
@@ -777,28 +856,39 @@ function handleEvent(key, e) {
   st.brk = "";
 
   const rawOv = e.over != null ? String(e.over) : "";
-  // FIX #5: prefer e.ball, fall back to e.xball.
   const ballRef = e.ball != null ? e.ball : e.xball;
   const low = ev.toLowerCase();
   const parsed = resultFromEvent(low, ev);
-  const ovIdx = parseInt(rawOv, 10);
-  const ballNo = rawOv.includes(".")
+  let ovIdx = parseInt(rawOv, 10);
+  let ballNo = rawOv.includes(".")
     ? parseInt(rawOv.split(".")[1], 10)
     : (ballRef != null ? parseInt(ballRef, 10) : NaN);
 
-  // Include wide/no-ball in chip (not just legal balls)
+  if (isNaN(ovIdx) && st.dotsOver != null) ovIdx = Number(st.dotsOver);
+  if (isNaN(ovIdx) && st.ov) ovIdx = Math.floor(ovVal(st.ov) / 6);
+  if (isNaN(ballNo)) {
+    const legalCount = st.dots.filter(x => x.legal).length;
+    ballNo = legalCount + (parsed && parsed.legal ? 1 : 0);
+    if (ballNo < 1) ballNo = 1;
+  }
+
   if (parsed && !isNaN(ovIdx) && !isNaN(ballNo)) {
     if (st.dotsOver == null || ovIdx > st.dotsOver) {
       st.dots = [];
       st.dotsOver = ovIdx;
     }
     if (ovIdx === st.dotsOver) {
-      const dotId = makeDotId(ovIdx, ballNo, parsed.legal, e.code || ev);
+      const dotId = makeDotId(ovIdx, ballNo, parsed.legal, e.code || ev, e.xball);
       const existing = st.dots.findIndex(d => d.id === dotId);
-      const entry = { id: dotId, ...dotEntry(parsed.info, parsed.legal) };
+      const entry = { id: dotId, ballNo, xball: e.xball, ...dotEntry(parsed.info, parsed.legal) };
       if (existing >= 0) {
-        st.dots[existing] = entry;
-        log(`# correction ball ${esc(rawOv)}: "${esc(ev)}"`);
+        const old = st.dots[existing];
+        if (old.c === "w" && parsed.info.kind !== "wicket") {
+          log(`# wicket protected at ${esc(rawOv)} (ignored "${esc(ev)}")`);
+        } else {
+          st.dots[existing] = entry;
+          log(`# correction ball ${esc(rawOv)}: "${esc(ev)}"`);
+        }
       } else {
         const legalCount = st.dots.filter(x => x.legal).length;
         if (parsed.legal ? (legalCount < ballNo) : true) st.dots.push(entry);
@@ -824,7 +914,14 @@ function newInnings(st) {
 }
 
 function infoFromComm(e) {
-  if (e.w) return { text: "WICKET", kind: "wicket" };
+  if (e.w) {
+    return {
+      text: "W",
+      kind: "wicket",
+      chipText: wicketChipText(e),
+      sub: e.dis ? wicketLabel(e.dis) : ""
+    };
+  }
   if (e.nb > 0) return { text: e.bat > 0 ? `NO BALL +${e.bat}` : "NO BALL", kind: "noball" };
   if (e.wd > 0) {
     const wr = Math.max(0, e.run - 1);
@@ -832,17 +929,15 @@ function infoFromComm(e) {
   }
   if (e.six)  return { text: "6", kind: "six" };
   if (e.four) return { text: "4", kind: "four" };
-  if (e.by > 0) return { text: `${e.by}B`, kind: "raw" };
-  if (e.lb > 0) return { text: `${e.lb}LB`, kind: "raw" };
+  if (e.by > 0) return { text: "bye", kind: "raw", chipText: `${e.by}B` };
+  if (e.lb > 0) return { text: "legbye", kind: "raw", chipText: `${e.lb}LB` };
+  if (e.run === 0) return { text: "0", kind: "dot" };
   return { text: String(e.run), kind: "raw" };
 }
 const commLegal = e => !(e.wd > 0 || e.nb > 0);
 
-// Commentary applies only when it is AHEAD of the current chip state.
-// This prevents stale commentary from overwriting fresh ball events.
 function applyComm(key, m) {
   const st = ms(key);
-  // FIX #3: numeric-aware sort with lexicographic fallback for non-numeric IDs.
   const list = (m.comm || []).slice().sort((a, b) => {
     const na = Number(a.id), nb = Number(b.id);
     if (!isNaN(na) && !isNaN(nb)) return na - nb;
@@ -855,20 +950,69 @@ function applyComm(key, m) {
   const chipLegalCount = st.dots.filter(x => x.legal).length;
   const chipOver = st.dotsOver;
 
-  const shouldRebuild = chipOver == null
+  let hasValueDiff = false;
+  if (chipOver === maxOv) {
+    const chipByBall = {};
+    st.dots.forEach(d => {
+      if (!d.legal || d.ballNo == null) return;
+      chipByBall[d.ballNo] = d;
+    });
+    for (const e of list) {
+      if (e.ov !== maxOv || !commLegal(e)) continue;
+      const cb = chipByBall[e.b];
+      if (cb) {
+        const expect = e.w ? wicketChipText(e)
+                           : (e.six ? "6" : e.four ? "4" : String(e.run));
+        if (cb.t !== expect) { hasValueDiff = true; break; }
+      }
+    }
+  }
+
+  const shouldRebuild = (chipOver == null
     || maxOv > chipOver
-    || (maxOv === chipOver && commLegalCount > chipLegalCount);
+    || (maxOv === chipOver && commLegalCount > chipLegalCount)
+    || hasValueDiff);
 
   if (shouldRebuild) {
+    const prevWs = (st.dotsOver === maxOv)
+      ? st.dots.filter(d => d.c === "w")
+      : [];
+
     st.dots = list.filter(e => e.ov === maxOv)
       .map(e => ({
-        id: makeDotId(e.ov, e.b, commLegal(e), e.id),
+        id: makeDotId(e.ov, e.b, commLegal(e), e.id, e.x),
+        ballNo: e.b,
+        xball: e.x,
         ord: e.x || 0,
         ...dotEntry(infoFromComm(e), commLegal(e))
       }));
+
+    prevWs.forEach(w => {
+      const idx = st.dots.findIndex(d => d.id === w.id);
+      if (idx >= 0) {
+        if (st.dots[idx].c !== "w") st.dots[idx] = w;
+      } else {
+        const ballNo = (w.ballNo != null) ? w.ballNo : NaN;
+        let insertAt = st.dots.length;
+        if (!isNaN(ballNo) && ballNo > 0) {
+          let seen = 0;
+          for (let i = 0; i < st.dots.length; i++) {
+            if (st.dots[i].legal) {
+              seen++;
+              if (seen >= ballNo) { insertAt = i; break; }
+            }
+          }
+        }
+        st.dots.splice(insertAt, 0, w);
+      }
+    });
+
     st.dotsOver = maxOv;
 
-    if (st.phase === "result" && st.cur && st.cur.kind !== "raw" && st.cur.kind !== "wicket"
+    if (st.phase === "result" && st.cur
+        && st.cur.kind !== "wicket"
+        && st.cur.text !== "legbye"
+        && st.cur.text !== "bye"
         && st.curOv !== null && st.curBall !== null) {
       const match = list.find(e => e.ov === st.curOv && e.b === st.curBall);
       if (match) {
@@ -886,7 +1030,6 @@ function applyComm(key, m) {
 
   const newest = list[list.length - 1];
   const isNewBall = newest.id !== st.lastCommId;
-  const first = st.lastCommId == null;
   st.lastCommId = newest.id;
 
   if (isNewBall && !isTest()) {
@@ -894,7 +1037,7 @@ function applyComm(key, m) {
     else if (newest.wd === 0) S.isFreeHitNext = false;
   }
 
-  if (isNewBall && !first && (!st.evAt || Date.now() - st.evAt > FALLBACK_QUIET_MS)) {
+  if (isNewBall && (!st.evAt || Date.now() - st.evAt > FALLBACK_QUIET_MS)) {
     _evSeq++;
     const info = infoFromComm(newest);
     st.lastBallAt = Date.now();
@@ -904,6 +1047,19 @@ function applyComm(key, m) {
     st.curBall = newest.b;
     st.phase = "result";
     renderBall(key);
+
+    if (info.kind === "wicket" && info.sub) {
+      if (st._dismissTimer) clearTimeout(st._dismissTimer);
+      const sub = info.sub;
+      st._dismissTimer = setTimeout(() => {
+        st._dismissTimer = null;
+        if (st.cur && st.cur.kind === "wicket") {
+          _evSeq++;
+          st.cur = { text: sub, kind: "raw" };
+          renderBall(key);
+        }
+      }, WICKET_HOLD_MS);
+    }
   }
 }
 
@@ -1039,6 +1195,7 @@ async function fetchBaseline(key, tries) {
 let _hinted = false;
 function updateViewport(m) {
   if (!S.matchKey) {
+    if (S.pendingKey) return;
     if (!_hinted) { log("# Select a match from Fixture."); _hinted = true; }
     if (EL.status) EL.status.textContent = "Select a match from Fixture";
     setBallIdle();
@@ -1054,7 +1211,6 @@ function startAll() {
   if (S.started) return;
   S.started = true;
   startLiveListener();
-  setActive(!!S.matchKey);
   log("# Live listener started.");
 }
 function stopAll() {
@@ -1074,7 +1230,36 @@ function setActive(on) {
   if (!b) return;
   S.active = !!on;
   b.classList.toggle("on", !!on);
-  b.textContent = on ? "ACTIVE MATCH" : "NO ACTIVE MATCH";
+  b.textContent = on ? "ACTIVE MATCH" : "ACTIVE";
+}
+
+/* ========= Dropdown settings persistence ========= */
+function _readSettings() {
+  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); }
+  catch (e) { return {}; }
+}
+function _writeSettings(data) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(data)); } catch (e) {}
+}
+function saveDropdownSetting(name, url, percent) {
+  const data = _readSettings();
+  data[name] = { url, percent, ts: Date.now() };
+  _writeSettings(data);
+}
+function removeDropdownSetting(name) {
+  const data = _readSettings();
+  delete data[name];
+  _writeSettings(data);
+}
+function loadDropdownSettings() {
+  const data = _readSettings();
+  document.querySelectorAll(".option-group").forEach(group => {
+    const name = group.dataset.group;
+    if (data[name]?.url) {
+      const inp = group.querySelector(".url-input");
+      if (inp) inp.value = data[name].url;
+    }
+  });
 }
 
 /* ========= Init ========= */
@@ -1091,30 +1276,64 @@ window.addEventListener("DOMContentLoaded", () => {
       },
       options: { responsive: false, animation: false, plugins: { legend: { display: false }, tooltip: { enabled: false } } }
     });
+  } else if (canvasEl && !window.Chart) {
+    log("# Chart.js not loaded — pie chart disabled", true);
   }
 
-  $("adminForm")?.addEventListener("submit", e => {
-    e.preventDefault();
-    let ok = true;
-    FORM_FIELDS.forEach(id => {
-      const el = $(id);
-      if (!el) return;
-      const empty = !el.value.trim();
-      el.classList.toggle("need", empty);
-      if (empty) ok = false;
+  $("activeBtn")?.addEventListener("click", activateMatch);
+
+  document.querySelectorAll("input.radio-look[data-target]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const target = document.getElementById(cb.dataset.target);
+      if (!target) return;
+      if (cb.checked) {
+        target.hidden = false;
+        document.querySelectorAll("input.radio-look[data-target]").forEach(other => {
+          if (other === cb) return;
+          other.checked = false;
+          const ot = document.getElementById(other.dataset.target);
+          if (ot) ot.hidden = true;
+        });
+      } else {
+        target.hidden = true;
+      }
     });
-    if (!ok) { log("# Please fill all required fields.", true); return; }
-    const data = {};
-    FORM_FIELDS.forEach(id => { data[id] = $(id).value.trim(); });
-    saveSettings(data);
-    setFormLocked(true);
-    log("Settings saved.");
   });
-  document.querySelector('[data-edit="adminForm"]')?.addEventListener("click", () => {
-    setFormLocked(false);
-    log("# Edit mode enabled.");
+
+  document.querySelectorAll(".dropdown").forEach(dd => {
+    const group = dd.closest(".option-group");
+    const groupName = group?.dataset.group || "";
+    const urlInput = dd.querySelector(".url-input");
+
+    if (urlInput) {
+      urlInput.addEventListener("input", () => urlInput.classList.remove("need"));
+    }
+
+    dd.querySelectorAll(".btns button").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+
+        if (btn.classList.contains("submit")) {
+          const url = urlInput?.value.trim() || "";
+          if (!url) {
+            log(`# Match URL required for ${esc(groupName)}`, true);
+            urlInput?.classList.add("need");
+            return;
+          }
+          urlInput.classList.remove("need");
+          const pct = btn.textContent.trim();
+          log(`# Set <b>${esc(groupName)}</b>: ${esc(pct)} — ${esc(url)}`);
+          saveDropdownSetting(groupName, url, pct);
+        } else if (btn.classList.contains("edit")) {
+          if (urlInput) urlInput.value = "";
+          removeDropdownSetting(groupName);
+          log(`# Reset: ${esc(groupName)}`);
+        } else if (btn.classList.contains("stop")) {
+          log(`# Stop: ${esc(groupName)}`);
+        }
+      });
+    });
   });
-  FORM_FIELDS.forEach(id => $(id)?.addEventListener("input", () => $(id).classList.remove("need")));
 
   $("bStop")?.addEventListener("click", stopAll);
   $("bRestart")?.addEventListener("click", () => { stopAll(); setTimeout(startAll, 300); });
@@ -1125,17 +1344,17 @@ window.addEventListener("DOMContentLoaded", () => {
       btn.style.background = S.auto ? "var(--cyan)" : "";
       btn.style.color = S.auto ? "#000" : "";
     }
-    if (S.auto && !S.started) startAll();
+    if (S.auto && !S.started && S.pendingKey) activateMatch();
   });
 
-  loadSettings();
+  loadDropdownSettings();
   loadFixtures();
   setInterval(() => loadFixtures(true), FIXTURE_POLL_MS);
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       loadFixtures(true);
-      if (_pieData.dirty) _pieRenderNow();
+      if (_pieData.dirty) _pieScheduleRaf();
       if (S.started && (!S.ws || S.ws.readyState !== WebSocket.OPEN)) startLiveListener();
     }
   });
