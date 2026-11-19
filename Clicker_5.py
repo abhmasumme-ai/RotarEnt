@@ -1,5 +1,5 @@
 """
-clicker.py - v15 (fastest pipeline, main.py v8/v9/v10 compatible)
+clicker.py - v15 (fastest pipeline, click -70% accurracy 95% main.py v8/v9/v10 compatible)
 =================================================================
 Bug fixes over v14:
   1. xball=0 edge case in compute_want (fallback to ball)
