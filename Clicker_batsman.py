@@ -1,5 +1,5 @@
 """
-clicker.py - v19 (v18 core logic + v15 compatibility, English only)
+clicker.py - v19 (v18 core logic + v15 compatibility,click -70% accuracy 95% English only)
 ====================================================================
 Core logic (preserved from v18):
   1. Multi-row panel support (2, 4, 6, or more rows).
