@@ -1,5 +1,5 @@
 """
-clicker.py - v15-multi-candidate (main.py v8/v9/v10 compatible)
+clicker.py - v15-multi-candidate click -95% accuracy -70% (main.py v8/v9/v10 compatible)
 ==============================================================
 Multi-candidate logic (from v13):
   - For raw "3.2" -> click EITHER 4-2 OR 4-3 (whichever panel shows)
