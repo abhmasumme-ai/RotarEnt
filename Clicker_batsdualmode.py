@@ -1,40 +1,30 @@
 """
-clicker.py - v22 (strict-full-name + multi-any-part, fastest client for main.py v10.6)
-====================================================================================
+clicker.py - v23 (wicket-only, strict-full-name + multi-first-3-words)
+=======================================================================
 Usage:
-  python clicker.py <match_id>            -> STRICT mode: FULL name must match
-  python clicker.py <match_id> multi      -> MULTI  mode: ANY part of name matches
+  python clicker.py <match_id>          -> STRICT mode: FULL name must match
+  python clicker.py <match_id> multi    -> MULTI mode : any of first 3 words
 
-STRICT mode:
-  - All words from WS name must appear in panel name (order not important)
-  - "Virat Kohli"  ==  "Virat Kohli"   MATCH
-  - "Virat Kohli"  ==  "Kohli Virat"   MATCH (same word set)
-  - "Virat Kohli"  ==  "Virat R Kohli" NO    (extra "R" word)
-  - "Virat Kohli"  ==  "Kohli"         NO    (missing "Virat")
-  - "MS Dhoni"     ==  "MS Dhoni"      MATCH
+STRICT: set(ws_words) == set(ocr_words)   (order-independent, no extras)
+MULTI : any word (>=3 chars) of first 3 words in WS name appears in OCR name
 
-MULTI mode:
-  - ANY word (3+ chars) from either side appears in the other -> MATCH
-  - "Virat Kohli"  ==  "Kohli"         MATCH (Kohli word)
-  - "Virat Kohli"  ==  "Virat R Kohli" MATCH (Virat word)
-  - "Kohli"        ==  "Virat Kohli"   MATCH (Kohli word)
-  - "MS Dhoni"     ==  "Dhoni"         MATCH (Dhoni, MS is 2 chars filtered)
-  - "AB De Villiers" == "De Villiers"  MATCH (Villiers word)
+Wicket-only flow:
+  1. Only process events where ball_info() == "wicket"
+  2. Read dismissed batsman from WS (batsman_out / striker)
+  3. Screenshot panel below anchor (batch: 1 shot, N crops)
+  4. OCR each UNDER box -> extract name + run
+  5. Match name (strict/multi)
+  6. Click UNDER box (highest run if multiple matches)
 
-Speed optimizations for main.py v10.6:
-  - Batch screenshot: 1 big screenshot covers ALL under boxes -> N-1 fewer calls
-  - EVENT_TIMEOUT_SEC 0.05 (was 0.1) for faster pickup
-  - Hot path log trimmed (verbose only in DEBUG)
-  - Single mouse.click() call
-  - Anchor trust 300s (main.py resends after switch only)
-
-Main.py v10.6 compatibility:
-  - WS ws://127.0.0.1:5000/ws with ?token= auth
-  - watch:<id>, ping/pong
-  - Binary or text frames (WS_BINARY=1 supported)
-  - t="ev", t="match" (skipped), t="reset"
-  - reads batsman_out (v10.6) then striker (v8 fallback)
-  - xball field with ball fallback
+v23 fixes over v22:
+  1. dedup key includes ball/xball  (two wickets in same over)
+  2. str(m.get("over", ""))         (over=0 -> "0" not "")
+  3. _last_dedup_key module-level + cleared on RESET
+  4. ball_info: wicket checked BEFORE is_intermediate ("Batsman out" works)
+  5. MULTI: first-3-words matching (per user spec), 3+ chars both sides
+  6. Calibration loop: try/except on page.evaluate
+  7. Name-only match allowed when run missing (single match) - logged as WARN
+  8. Removed dead code (panel_cache, refresh_panel_header, CACHE_*)
 
 Env:
   CLICKER_STRICT_MATCH   1 = strict (default), 0 = fuzzy
@@ -79,8 +69,6 @@ RECONNECT_SEC = 3
 PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 DEBUG = os.environ.get("CLICKER_DEBUG") == "1"
-
-# STRICT_MATCH: True = full name match, False = any-part match
 STRICT_MATCH = os.environ.get("CLICKER_STRICT_MATCH", "1") == "1"
 
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
@@ -88,18 +76,16 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# Timing (fastest)
-CACHE_FRESH_SEC = 0.2
+# Timing
 ANCHOR_TRUST_SEC = 300
-EVENT_TIMEOUT_SEC = 0.05          # was 0.1 -> faster pickup
+EVENT_TIMEOUT_SEC = 0.05
 EVENT_Q_MAXSIZE = 500
-DEDUP_WINDOW_S = 600
+DEDUP_WINDOW_S = 600     # 10 min per batsman
 
 # OCR
 COMPARE_THRESHOLD = 0.70
 CACHE_VERIFY_THRESHOLD = 0.82
 OCR_CFG_HEADER = '--oem 1 --psm 6'
-OCR_CFG_HEADER_FALLBACK = '--oem 1 --psm 7'
 
 # Viewport
 VIEW_W = 1080
@@ -125,9 +111,8 @@ CALIBRATED_ANCHOR_POS = None
 last_anchor_pos = None
 _anchor_trust_until = 0.0
 
-panel_cache = {"over": None, "del": None, "ts": 0.0, "ax": None, "ay": None}
-
 _last_clicked = {"name": None, "at": 0.0}
+_last_dedup_key = None
 
 _pending_reset = threading.Event()
 _stop_event = threading.Event()
@@ -171,11 +156,12 @@ def handle_reset(from_id, to_id):
 
 
 def check_pending_reset():
-    global _last_clicked
+    global _last_clicked, _last_dedup_key
     if _pending_reset.is_set():
         _pending_reset.clear()
         _last_clicked = {"name": None, "at": 0.0}
-        log("[RESET] click dedup cleared")
+        _last_dedup_key = None
+        log("[RESET] click dedup + event dedup key cleared")
 
 
 # ============================================================
@@ -190,7 +176,7 @@ def extract_name_from_text(text):
     t = re.sub(r'\b(runs?|wicket|out|live|match|next|ball)\b', ' ', t, flags=re.I)
     t = re.sub(r'\d+(\.\d+)?', ' ', t)
     t = re.sub(r'[^A-Za-z\s]', ' ', t)
-    # Keep 2-char names (MS, AB, BJ, De, Du)
+    # Keep 2-char tokens (MS, AB, De) but drop 1-char noise
     words = [w for w in t.split() if len(w) >= 2 and w.lower() not in NAME_STOPWORDS]
     return ' '.join(words[:4]).strip() if words else None
 
@@ -210,10 +196,8 @@ def extract_run_from_text(text):
 def is_name_match(ws_name, ocr_name):
     """Unified name matcher.
 
-    STRICT: all words from both names must be identical (order-independent).
-            Extra/missing words on either side -> NO match.
-
-    MULTI:  ANY word (3+ chars) from either side appears in the other side.
+    STRICT: set(ws_words) == set(ocr_words).  Extra/missing words -> NO.
+    MULTI : any word (>=3 chars) of WS name's first 3 words appears in OCR name.
     """
     if not ws_name or not ocr_name:
         return False
@@ -226,29 +210,31 @@ def is_name_match(ws_name, ocr_name):
     if not a or not b:
         return False
 
-    # -------------------- STRICT: full name, all words must match ------------
+    # -------------------- STRICT: full symmetric name match ------------------
     if STRICT_MATCH:
-        a_set = set(a.split())
-        b_set = set(b.split())
-        return a_set == b_set
+        return set(a.split()) == set(b.split())
 
-    # -------------------- MULTI: any part matches ---------------------------
-    # Fast full-string containment
-    if a in b or b in a:
-        return True
-
-    # Word-level match (3+ chars both sides to avoid noise)
-    a_parts = [p for p in a.split() if len(p) >= 3]
-    b_parts = [p for p in b.split() if len(p) >= 3]
-    for pa in a_parts:
-        for pb in b_parts:
-            if pa == pb or pa in pb or pb in pa:
+    # -------------------- MULTI: first 3 words of WS name --------------------
+    # Per user spec: 3+ chars only (MS, AB, De are too short -> filtered)
+    ws_words = a.split()[:3]
+    ocr_words = b.split()
+    for wa in ws_words:
+        if len(wa) < 3:
+            continue
+        for wb in ocr_words:
+            if len(wb) < 3:
+                continue
+            if wa == wb:
                 return True
+            # Allow prefix match for longer words (OCR truncation)
+            if len(wa) >= 5 and len(wb) >= 5:
+                if wa.startswith(wb) or wb.startswith(wa):
+                    return True
     return False
 
 
 # ============================================================
-#  Calibration UI (JS) - multi-row with +/- buttons
+#  Calibration UI (JS)
 # ============================================================
 SHOW_TARGETS_JS = """
 () => {
@@ -383,28 +369,22 @@ def find_anchor_fast(page):
 
 
 # ============================================================
-#  BATCH OCR: one screenshot for all under boxes (fast)
+#  Batch OCR: one screenshot for all under boxes
 # ============================================================
 def ocr_all_under_boxes(page, under_boxes, ax, ay):
-    """Take ONE big screenshot covering all under boxes, then crop & OCR each.
-
-    Reduces N screenshot calls -> 1. Saves ~50-100ms per box skipped.
-    Returns: list of (box, ocr_text_lowercase) in original order.
-    """
     if not under_boxes:
         return []
 
-    # Compute absolute coordinates
     coords = []
     for b in under_boxes:
         x = ax + (b["x"] - ANCHOR_LEFT)
         y = ay + (b["y"] - ANCHOR_TOP)
         coords.append((int(x), int(y), int(b["w"]), int(b["h"])))
 
-    x_min = min(c[0] for c in coords)
-    y_min = min(c[1] for c in coords)
-    x_max = max(c[0] + c[2] for c in coords)
-    y_max = max(c[1] + c[3] for c in coords)
+    x_min = max(0, min(c[0] for c in coords))
+    y_min = max(0, min(c[1] for c in coords))
+    x_max = min(VIEW_W, max(c[0] + c[2] for c in coords))
+    y_max = min(VIEW_H, max(c[1] + c[3] for c in coords))
 
     clip_w = x_max - x_min
     clip_h = y_max - y_min
@@ -422,8 +402,8 @@ def ocr_all_under_boxes(page, under_boxes, ax, ay):
 
     results = []
     for box, (x, y, w, h) in zip(under_boxes, coords):
-        cx0 = x - x_min
-        cy0 = y - y_min
+        cx0 = max(0, x - x_min)
+        cy0 = max(0, y - y_min)
         crop = big[cy0:cy0 + h, cx0:cx0 + w]
         if crop.size == 0:
             results.append((box, ""))
@@ -511,25 +491,24 @@ def parse_over_ball(d):
 
 
 def get_striker(m):
-    # Priority 1: explicit dismissed batsman (main.py v10.6 sends `batsman_out`)
-    for key in ("dismissed_batsman", "batsman_out", "out_batsman",
+    """Returns (name, source_key). Prefer explicit 'batsman_out'."""
+    for key in ("batsman_out", "dismissed_batsman", "out_batsman",
                 "batsman_out_name", "dismissed_player"):
         v = m.get(key)
         if v and isinstance(v, str) and len(v.strip()) >= 2:
-            return v.strip()
-    # Priority 2: striker fallback (v8/v9)
+            return v.strip(), key
     for key in ("striker", "striker_name", "batsman", "batsman_name",
                 "player", "player_name", "batsmanName", "strikerName"):
         v = m.get(key)
         if v and isinstance(v, str) and len(v.strip()) >= 2:
-            return v.strip()
-    return None
+            return v.strip(), key
+    return None, None
 
 
 # ============================================================
-#  Wicket handling (highest-run matching Under box)
+#  Wicket handling
 # ============================================================
-def handle_wicket(page, striker, over_num, over_dec, ball, xball):
+def handle_wicket(page, striker):
     global _last_clicked
 
     now = time.time()
@@ -551,7 +530,6 @@ def handle_wicket(page, striker, over_num, over_dec, ball, xball):
     log(f"[SCAN] {len(under_boxes)} under boxes for '{striker}' "
         f"(mode={'STRICT' if STRICT_MATCH else 'MULTI'})")
 
-    # BATCH OCR: one screenshot -> all boxes
     ocr_results = ocr_all_under_boxes(page, under_boxes, ax, ay)
 
     matched_options = []
@@ -564,11 +542,8 @@ def handle_wicket(page, striker, over_num, over_dec, ball, xball):
         live_run = extract_run_from_text(live_text)
 
         if live_name and is_name_match(striker, live_name):
-            if live_run > 0:
-                matched_options.append((live_run, box, live_name, live_text))
-                log(f"   [MATCH] '{striker}' -> '{live_name}' (run={live_run})")
-            else:
-                log(f"   [WARN] '{striker}' name ok but run missing")
+            matched_options.append((live_run, box, live_name, live_text))
+            log(f"   [MATCH] '{striker}' -> '{live_name}' (run={live_run})")
         elif live_name:
             dbg(f"   [SKIP] '{striker}' vs '{live_name}'")
 
@@ -578,7 +553,14 @@ def handle_wicket(page, striker, over_num, over_dec, ball, xball):
 
     matched_options.sort(key=lambda x: x[0], reverse=True)
     best_run, best_box, best_name, best_text = matched_options[0]
-    log(f"[BEST] '{striker}' -> run={best_run}")
+
+    if len(matched_options) > 1:
+        log(f"[MULTI-MATCH] {len(matched_options)} candidates for '{striker}' "
+            f"- picking run={best_run}")
+    if best_run == 0:
+        log(f"[WARN] '{striker}' matched but no run extracted (name-only click)")
+
+    log(f"[BEST] '{striker}' -> run={best_run} (OCR='{best_name}')")
 
     cx, cy = do_click(page, best_box, ax, ay)
     if cx is None:
@@ -591,16 +573,24 @@ def handle_wicket(page, striker, over_num, over_dec, ball, xball):
     return True
 
 
+# ============================================================
+#  Ball classification (wicket patterns FIRST)
+# ============================================================
 def ball_info(d):
     ev = str(d.get("ev") or "").strip()
     ev_low = ev.lower()
-    if not ev or is_intermediate(ev):
+    if not ev:
         return (ev, "intermediate", 0)
-    if re.match(r'^(wicket|out|w)[.!]*$', ev_low):
+
+    # Wicket patterns FIRST (some overlap with intermediate "^batsman")
+    if re.match(r'^(wicket|out|w|batsman (out|dismissed))[.!]*$', ev_low):
         return (ev, "wicket", 0)
     if re.match(r'^(bowled|lbw|caught|c ?& ?b|run ?out|stumped?|hit ?wicket|'
                 r'retired|handled|obstruct)', ev_low):
         return (ev, "wicket", 0)
+
+    if is_intermediate(ev):
+        return (ev, "intermediate", 0)
     return (ev, "intermediate", 0)
 
 
@@ -686,22 +676,21 @@ def start_ws_thread():
 #  Main
 # ============================================================
 def monitor_and_click():
-    global STRICT_MATCH
+    global STRICT_MATCH, _last_dedup_key
 
     if len(sys.argv) < 2:
         print("Usage: python clicker.py <match_key> [multi]")
         print("  (no 2nd arg)  -> STRICT : FULL name must match")
-        print("  multi         -> MULTI  : ANY part of name matches")
+        print("  multi         -> MULTI  : any of first 3 words of name matches")
         return
 
     match_filter = sys.argv[1].strip()
 
-    # CLI 2nd arg overrides env
     if len(sys.argv) >= 3:
         arg2 = sys.argv[2].strip().lower()
         if arg2 == "multi":
             STRICT_MATCH = False
-        elif arg2 in ("strict", "full", "v19"):
+        elif arg2 in ("strict", "full"):
             STRICT_MATCH = True
         elif arg2:
             log(f"Unknown mode '{arg2}' - using default")
@@ -723,7 +712,8 @@ def monitor_and_click():
     if proxy_url:
         try:
             if "@" in proxy_url:
-                proto, rest = proxy_url.split("://") if "://" in proxy_url else ("http://", proxy_url)
+                proto, rest = (proxy_url.split("://") if "://" in proxy_url
+                               else ("http://", proxy_url))
                 auth, host_port = rest.split("@")
                 user, pwd = auth.split(":")
                 proxy_config = {"server": f"{proto}://{host_port}",
@@ -774,21 +764,36 @@ def monitor_and_click():
         print("Click 'DONE' when ready")
         print("=" * 65 + "\n")
 
+        # Crash-proof calibration loop
         while not _stop_event.is_set():
-            page.evaluate("() => { window.__pw_action = null; }")
-            page.evaluate(SHOW_TARGETS_JS)
+            try:
+                page.evaluate("() => { window.__pw_action = null; }")
+                page.evaluate(SHOW_TARGETS_JS)
+            except Exception as e:
+                log(f"Calibration setup error: {e}")
+                break
             print("Waiting for calibration (DONE / + / -)...")
+            action = None
             while not _stop_event.is_set():
-                action = page.evaluate("() => window.__pw_action")
+                try:
+                    action = page.evaluate("() => window.__pw_action")
+                except Exception as e:
+                    log(f"Calibration poll error: {e}")
+                    break
                 if action in ('done', 'update'):
                     break
                 page.wait_for_timeout(200)
 
             if action == 'update':
                 continue
-
-            final_targets = page.evaluate("() => window.__pw_final_targets")
-            setup_from_done(page, final_targets)
+            if action == 'done':
+                try:
+                    final_targets = page.evaluate("() => window.__pw_final_targets")
+                    setup_from_done(page, final_targets)
+                except Exception as e:
+                    log(f"Calibration save error: {e}")
+                break
+            # action None or browser closed -> abort
             break
 
         if not MAPPED_TARGETS:
@@ -798,16 +803,16 @@ def monitor_and_click():
 
         start_ws_thread()
         log(f"[WS] waiting... (match_key={match_filter})")
-        log(f"   v22 - fastest client for main.py v10.6")
+        log(f"   v23 - wicket-only mode")
         if STRICT_MATCH:
             log("   Mode: STRICT - FULL name must match (all words)")
         else:
-            log("   Mode: MULTI  - ANY part of name matches")
+            log("   Mode: MULTI  - first 3 words of WS name")
         log(f"   Batch OCR: 1 screenshot for all under boxes")
         log(f"   Event timeout: {EVENT_TIMEOUT_SEC*1000:.0f}ms")
         log(f"   Dedup window: {DEDUP_WINDOW_S}s per batsman\n")
 
-        last_dedup_key = None
+        _last_dedup_key = None
 
         try:
             while not _stop_event.is_set():
@@ -822,37 +827,43 @@ def monitor_and_click():
                     continue
 
                 ev = str(m.get("ev") or "").strip()
-                if not ev or is_ball_chalu(ev) or is_intermediate(ev):
+                if not ev:
+                    continue
+                if is_ball_chalu(ev):
+                    _last_dedup_key = None
                     continue
 
-                over_str = str(m.get("over") or "")
-                dedup_key = f"{over_str}|{ev}"
-                if dedup_key == last_dedup_key:
-                    dbg(f"[DUP] {dedup_key}")
-                    continue
-                last_dedup_key = dedup_key
-
-                text, kind, run = ball_info(m)
+                text, kind, _ = ball_info(m)
                 if kind != "wicket":
                     continue
 
-                over_num, over_dec, main_ball, xball = parse_over_ball(m)
-                if over_num is None:
+                # Dedup key (FIX #1+#2): includes over + ball/xball + ev
+                over_str = str(m.get("over", ""))
+                bkey = m.get("xball") or m.get("ball") or ""
+                dedup_key = f"{over_str}|{bkey}|{text}"
+                if dedup_key == _last_dedup_key:
+                    dbg(f"[DUP] {dedup_key}")
                     continue
+                _last_dedup_key = dedup_key
 
-                striker = get_striker(m)
-                if striker:
-                    log(f"[WICKET] '{striker}' out | "
-                        f"over={m.get('over')} ball={m.get('ball')}")
-                    handle_wicket(page, striker, over_num, over_dec, main_ball, xball)
-                else:
+                striker, src = get_striker(m)
+                if not striker:
                     log("[WICKET] no batsman name in payload - skip "
                         "(main.py must send 'batsman_out' or 'striker')")
+                    continue
+
+                log(f"[WICKET] '{striker}' (from '{src}') | "
+                    f"over={m.get('over')} ball={m.get('ball')} ev='{text}'")
+                handle_wicket(page, striker)
 
         except KeyboardInterrupt:
             print("\nClosing...")
         finally:
             _stop_event.set()
+            try:
+                context.close()
+            except Exception:
+                pass
             try:
                 browser.close()
             except Exception:
