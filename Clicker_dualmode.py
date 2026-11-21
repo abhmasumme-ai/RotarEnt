@@ -1,16 +1,27 @@
 """
-clicker.py - v16 (merged: v15 single-exact + v15-multi-candidate)
-==================================================================
+clicker.py - v17 (merged: v15 single-exact + multi-candidate, bug-fixed)
+=======================================================================
 Modes:
-  - Default (v15 single-exact):
+  - Single-exact (default, v15 behavior):
         python clicker.py <match_id>
         want = (over+1, xball|ball)  -- only this exact panel is clicked
 
-  - Multi-candidate (v15-multi):
+  - Multi-candidate:
         python clicker.py <match_id> multi
         (or)  CLICKER_MULTI=1 python clicker.py <match_id>
         raw "3.2" -> click 4-2 OR 4-3
-        raw "3.6" -> click 4-6 OR 5-1
+        raw "3.6" -> click 4-6 OR 5-1   <- over boundary
+        raw "4.1" -> click 5-1 OR 5-2   <- over boundary (next over)
+
+v17 fixes over v16:
+  1. Multi-mode dedup: panel-level (not candidate-overlap) => 3.6->4.1 no longer skipped
+  2. Dedup key includes ball/xball (consecutive dots no longer collide)
+  3. str(m.get("over", "")) instead of str(m.get("over") or "") => over=0 works
+  4. max_boxes = len(final_targets) => all calibrated rows used (was capped at 3)
+  5. Calibration loop crash-proof (action=None + try/except)
+  6. _last_dedup_key cleared on RESET
+  7. Removed duplicate is_intermediate check
+  8. _recent_clicked used in BOTH modes for actual panel value
 
 Compatibility with main.py v8/v9/v10:
   - Binary WS frames (bytes + str)
@@ -28,7 +39,7 @@ Env:
   CLICKER_SITE_URL       optional (else prompt)
   CLICKER_MATCH_URL      optional (else prompt)
   CLICKER_PROXY_URL      optional proxy URL
-  CLICKER_DEDUP_WINDOW   default 20 (single mode)
+  CLICKER_DEDUP_WINDOW   default 30
   TESSERACT_CMD          custom tesseract path
 """
 import asyncio
@@ -65,14 +76,14 @@ PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 DEBUG = os.environ.get("CLICKER_DEBUG") == "1"
 NO_IDLE = os.environ.get("CLICKER_NO_IDLE") == "1"
-DEDUP_WINDOW = int(os.environ.get("CLICKER_DEDUP_WINDOW", "20"))
-MULTI_MODE = os.environ.get("CLICKER_MULTI") == "1"   # can be overridden by CLI
+DEDUP_WINDOW = int(os.environ.get("CLICKER_DEDUP_WINDOW", "30"))
+MULTI_MODE = os.environ.get("CLICKER_MULTI") == "1"   # overridable by CLI
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# Timing
+# Timing - fastest pipeline settings
 CACHE_FRESH_SEC = 0.5
 IDLE_REFRESH_SEC = 0.4
 ANCHOR_TRUST_SEC = 60
@@ -99,7 +110,6 @@ ANCHOR_LEFT = 70
 ANCHOR_TOP = 400
 ANCHOR_W = 100
 ANCHOR_H = 34
-TARGET_ROWS = 3
 
 # State
 ANCHOR_TEMPLATE = {}
@@ -113,12 +123,12 @@ panel_cache = {
     "over": None, "del": None, "ts": 0.0, "ax": None, "ay": None,
 }
 
-# Dedup state
-_recent_clicked = collections.deque(maxlen=DEDUP_WINDOW)  # single mode
-_last_clicked_want = None                                 # multi mode
+# Dedup state (both modes use _recent_clicked with ACTUAL panel value)
+_recent_clicked = collections.deque(maxlen=DEDUP_WINDOW)
 
 _pending_reset = threading.Event()
 _xball_missing_logged = False
+_last_dedup_key = None      # module-level so RESET can clear it
 
 WS_STATE = {"match_filter": "", "up": False, "msg_count": 0, "last_ts": 0.0}
 event_q = queue.Queue(maxsize=EVENT_Q_MAXSIZE)
@@ -162,13 +172,13 @@ def handle_reset(from_id, to_id):
 
 
 def check_pending_reset():
-    """Called from main thread. Clears dedup safely."""
-    global _last_clicked_want
+    """Called from main thread. Clears dedup + dedup key safely."""
+    global _last_dedup_key
     if _pending_reset.is_set():
         _pending_reset.clear()
         _recent_clicked.clear()
-        _last_clicked_want = None
-        log("[RESET] dedup cleared")
+        _last_dedup_key = None
+        log("[RESET] dedup window + dedup key cleared")
 
 
 # ============================================================
@@ -256,7 +266,8 @@ def setup_from_done(page, final_targets):
 
     MAPPED_TARGETS.clear()
     KNOWN_LINES = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
-    max_boxes = TARGET_ROWS * 2
+    # FIX #4: use ALL calibrated targets, not just first 3 rows
+    max_boxes = len(final_targets)
 
     for i, t in enumerate(final_targets[:max_boxes]):
         x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
@@ -450,7 +461,7 @@ def do_click(page, target_box, ax, ay):
 
 
 # ============================================================
-#  Over/ball parsing (returns over_num, over_dec, ball, xball)
+#  Over/ball parsing
 # ============================================================
 def parse_over_ball(d):
     ov = d.get("over")
@@ -508,8 +519,8 @@ def parse_over_ball(d):
 
 # ============================================================
 #  Want candidates (used by BOTH modes)
-#  - cands[0] == v15 single-exact want
-#  - cands[0..1] == v15-multi candidates
+#  - cands[0] == single-exact want
+#  - cands[0..1] == multi-candidate
 # ============================================================
 def compute_want_candidates(over_num, over_dec, ball, xball):
     global _xball_missing_logged
@@ -545,7 +556,7 @@ def compute_want_candidates(over_num, over_dec, ball, xball):
 #  Event processing (unified single + multi)
 # ============================================================
 def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
-    global _last_clicked_want, _last_click_at
+    global _last_click_at
 
     t0 = time.perf_counter()
     side_want, line_want = decide_side_line(run, kind)
@@ -553,7 +564,6 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
 
     if MULTI_MODE:
         cands = all_cands
-        dedup_hit = _last_clicked_want in cands if _last_clicked_want else False
         cand_str = " | ".join(f"{o}-{d}" for o, d in cands) if cands else "?"
         log(f"[TARGET] {ball_key} run={run}({kind}) -> "
             f"{side_want} {line_want} | want: {cand_str} "
@@ -561,21 +571,23 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
     else:
         cands = all_cands[:1]
         want = cands[0] if cands else None
-        dedup_hit = bool(want and want in _recent_clicked)
         cand_str = f"{want[0]}-{want[1]}" if want else "?"
         log(f"[TARGET] {ball_key} run={run}({kind}) -> "
             f"{side_want} {line_want} | want={cand_str}")
 
-    if dedup_hit:
-        log(f"[ALREADY-CLICKED] ({cand_str})")
+    if not cands:
+        log(f"[NO-CANDIDATE] over_num={over_num} over_dec={over_dec}")
         return False
 
     if side_want is None:
         log(f"[NO-MAPPED-LINE] run={run} - skip")
         return False
 
-    if not cands:
-        log(f"[NO-CANDIDATE] over_num={over_num} over_dec={over_dec}")
+    # Single-mode fast pre-dedup: if exact want already clicked, skip entirely.
+    # (Multi-mode CANNOT use this: overlap between consecutive candidate sets
+    #  is expected, e.g. 3.6 -> (4,6),(5,1) then 4.1 -> (5,1),(5,2).)
+    if not MULTI_MODE and cands[0] in _recent_clicked:
+        log(f"[ALREADY-CLICKED] ({cand_str})")
         return False
 
     target_box = find_target(side_want, line_want)
@@ -584,11 +596,16 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
         return False
 
     def check_and_click(source):
-        global _last_clicked_want, _last_click_at
+        """Read current panel; click only if it's in cands AND not already clicked."""
+        global _last_click_at
         po, pd = panel_cache["over"], panel_cache["del"]
         if po is None or pd is None:
             return False
         if (po, pd) not in cands:
+            return False
+        # FIX #1: panel-level dedup — this is what fixes 3.6->4.1
+        if (po, pd) in _recent_clicked:
+            log(f"[ALREADY-CLICKED] panel {po}-{pd} (in dedup window)")
             return False
         cx, cy = do_click(page, target_box,
                           panel_cache["ax"], panel_cache["ay"])
@@ -598,21 +615,19 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
         log(f"[CLICK-{source}] panel={po}-{pd} "
             f"target={side_want} {line_want} "
             f"@({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        if MULTI_MODE:
-            _last_clicked_want = (po, pd)
-        else:
-            _recent_clicked.append((po, pd))
+        # FIX #1: record ACTUAL panel value in _recent_clicked (both modes)
+        _recent_clicked.append((po, pd))
         _last_click_at = time.time()
-        panel_cache["ts"] = 0
+        panel_cache["ts"] = 0    # invalidate cache — panel has advanced
         return True
 
-    # Fast path: cache hit
+    # Fast path: cache hit (cache populated by a recent idle-refresh OCR)
     cache_age = time.time() - panel_cache["ts"]
     if cache_age < CACHE_FRESH_SEC and panel_cache["ax"] is not None:
         if check_and_click(f"CACHE age={cache_age*1000:.0f}ms"):
             return True
 
-    # Slow path: OCR
+    # Slow path: OCR refresh
     ax, ay = find_anchor_fast(page)
     if ax is None:
         log("[NO-ANCHOR]")
@@ -744,9 +759,10 @@ def start_ws_thread():
 #  Main
 # ============================================================
 def monitor_and_click():
-    global MULTI_MODE
+    global MULTI_MODE, _last_dedup_key
+
     if len(sys.argv) < 2:
-        print("Usage: python clicker.py <match_key> [multi]")
+        print("Usage: python clicker.py <match_key> [multi|single]")
         return
     match_filter = sys.argv[1].strip()
 
@@ -826,24 +842,43 @@ def monitor_and_click():
         print("Click 'DONE' when ready")
         print("=" * 65 + "\n")
 
+        # FIX #5: calibration loop is now crash-proof
         while not _stop_event.is_set():
-            page.evaluate("() => { window.__pw_action = null; }")
-            page.evaluate(SHOW_TARGETS_JS)
+            try:
+                page.evaluate("() => { window.__pw_action = null; }")
+                page.evaluate(SHOW_TARGETS_JS)
+            except Exception as e:
+                log(f"Calibration setup error: {e}")
+                break
             print("Waiting for calibration (DONE / + / - / RESET)...")
+            action = None
             while not _stop_event.is_set():
-                action = page.evaluate("() => window.__pw_action")
+                try:
+                    action = page.evaluate("() => window.__pw_action")
+                except Exception as e:
+                    log(f"Calibration poll error: {e}")
+                    break
                 if action in ('done', 'update', 'reset'):
                     break
                 page.wait_for_timeout(200)
             if action == 'done':
-                final_targets = page.evaluate("() => window.__pw_final_targets")
-                setup_from_done(page, final_targets)
+                try:
+                    final_targets = page.evaluate("() => window.__pw_final_targets")
+                    setup_from_done(page, final_targets)
+                except Exception as e:
+                    log(f"Calibration save error: {e}")
                 break
             elif action == 'reset':
-                page.evaluate("() => { window.__row_count = 3; }")
+                try:
+                    page.evaluate("() => { window.__row_count = 3; }")
+                except Exception:
+                    break
                 continue
             elif action == 'update':
                 continue
+            else:
+                # action == None or browser closed
+                break
 
         if not MAPPED_TARGETS:
             log("No targets mapped - aborting.")
@@ -855,17 +890,18 @@ def monitor_and_click():
         if MULTI_MODE:
             log("   Mode: MULTI-candidate")
             log("   raw 3.2 -> click 4-2 OR 4-3")
-            log("   raw 3.6 -> click 4-6 OR 5-1")
+            log("   raw 3.6 -> click 4-6 OR 5-1  (over boundary)")
+            log("   raw 4.1 -> click 5-1 OR 5-2  (over boundary)")
         else:
-            log("   Mode: SINGLE-exact (v15)")
+            log("   Mode: SINGLE-exact")
             log("   want = (over+1, xball|ball) - exact only")
-            log(f"   dedup window {DEDUP_WINDOW}")
+        log(f"   dedup window {DEDUP_WINDOW}")
         log(f"   cache fresh <{CACHE_FRESH_SEC*1000:.0f}ms")
         log(f"   idle refresh every {IDLE_REFRESH_SEC*1000:.0f}ms"
             f"{' [DISABLED]' if NO_IDLE else ''}")
         log(f"   post-click cooldown {POST_CLICK_COOLDOWN*1000:.0f}ms\n")
 
-        last_dedup_key = None
+        _last_dedup_key = None
 
         try:
             while not _stop_event.is_set():
@@ -891,8 +927,6 @@ def monitor_and_click():
                         refresh_panel_header(page, ax, ay, px, py, box["h"])
                     continue
 
-                if m.get("t") == "match":
-                    continue
                 if m.get("t") != "ev":
                     continue
 
@@ -900,17 +934,17 @@ def monitor_and_click():
                 if not ev:
                     continue
                 if is_ball_chalu(ev):
-                    last_dedup_key = None
-                    continue
-                if is_intermediate(ev):
+                    _last_dedup_key = None
                     continue
 
-                over_str = str(m.get("over") or "")
-                dedup_key = f"{over_str}|{ev}"
-                if dedup_key == last_dedup_key:
+                # FIX #2 + #3: dedup key includes ball/xball; safe over stringify
+                over_str = str(m.get("over", ""))
+                bkey = m.get("xball") or m.get("ball") or ""
+                dedup_key = f"{over_str}|{bkey}|{ev}"
+                if dedup_key == _last_dedup_key:
                     log(f"[DUP] {dedup_key}")
                     continue
-                last_dedup_key = dedup_key
+                _last_dedup_key = dedup_key
 
                 text, kind, run = ball_info(m)
                 if kind == "intermediate":
@@ -939,6 +973,10 @@ def monitor_and_click():
             print("\nClosing...")
         finally:
             _stop_event.set()
+            try:
+                context.close()
+            except Exception:
+                pass
             try:
                 browser.close()
             except Exception:
