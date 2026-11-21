@@ -1,33 +1,46 @@
 """
-clicker_custom.py - v2 (dynamic over/threshold - set boxes ONCE, runs forever)
+clicker_custom.py - v4 (general: WS over<=25 + match | multi: any over side-only)
 ================================================================================
 
 Key facts:
   * Blue anchor box  -> position saved ONCE at DONE. Read each click for log.
   * Red boxes (1 row x 2 cols default) -> positions saved ONCE at DONE.
   * Text INSIDE red boxes is DYNAMIC:
-        "25 over total run under 136"  -> today over 25 / threshold 136
-        "26 over total run under 141"  -> later over 26 / threshold 141 (auto-detected)
-    Script re-OCRs boxes every click, parses numbers dynamically.
+        "25 over total run under 136"
+        "26 over total run over 141"
+    Script re-OCRs boxes every click, parses over + side + threshold fresh.
     You do NOT touch DONE again during the match.
 
-Click rules:
-  Wicket                       -> click matching-over panel with HIGHEST threshold
-  4 / 6                        -> click matching-over panel with HIGHEST threshold
-  wide+4 / wide+6              -> click matching-over panel with HIGHEST threshold
-  noball / noball+4 / noball+6 -> click matching-over panel with HIGHEST threshold
+Click rules (side = under/over read from red box text):
+  Wicket                       -> click 'under' side panel
+  4 / 6                        -> click 'over' side panel
+  wide+4 / wide+6              -> click 'over' side panel
+  noball+4 / noball+6          -> click 'over' side panel
+  noball (plain)               -> click 'over' side panel
   dot / 1 / 2 / 3 / plain wide -> skip (no click)
 
-Multiple panels for same over -> highest threshold wins (your examples: 136 both times).
-
 Modes:
-  python clicker_custom.py <match_id>          # SINGLE: fresh OCR (safe)
-  python clicker_custom.py <match_id> multi    # MULTI:  1.5s cache (fast)
+  python clicker_custom.py <match_id>
+      GENERAL:
+        * WS over MUST be <= GENERAL_MAX_OVER (default 25)
+          e.g. WS over 18/19/20/21/22/23/24/25 -> click allowed
+          e.g. WS over 26/27/...               -> skip (no click)
+        * WS over MUST match a panel's over (exact, +1 fallback)
+        * side MUST match (wicket=under, 4/6=over)
+        * Highest threshold wins.
+
+  python clicker_custom.py <match_id> multi
+      MULTI:
+        * WS over ANY value (no max limit) -> click allowed
+        * side-only match (over number NOT required)
+        * Picks panel closest to current WS over (tiebreak: highest thr)
+        * Fastest path.
 
 Env:
   CLICKER_WS_URL / CLICKER_WS_TOKEN / CLICKER_HEADLESS / CLICKER_DEBUG
   CLICKER_NO_IDLE / CLICKER_MULTI / CLICKER_SITE_URL / CLICKER_MATCH_URL
   CLICKER_PROXY_URL / CLICKER_DEDUP_WINDOW / TESSERACT_CMD
+  CLICKER_GENERAL_MAX_OVER (default 25)
 """
 import asyncio
 import collections
@@ -70,9 +83,12 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
+# GENERAL mode: WS over must be <= this to allow click
+GENERAL_MAX_OVER = int(os.environ.get("CLICKER_GENERAL_MAX_OVER", "25"))
+
 # Timing
-PANEL_CACHE_FRESH_SEC = 0.3           # single mode: fresh OCR essentially always
-PANEL_CACHE_FRESH_SEC_MULTI = 1.5     # multi mode: aggressive cache
+PANEL_CACHE_FRESH_SEC = 0.3
+PANEL_CACHE_FRESH_SEC_MULTI = 1.5
 IDLE_REFRESH_SEC = 0.5
 EVENT_TIMEOUT_SEC = 0.01
 POST_CLICK_COOLDOWN = 0.1
@@ -81,10 +97,10 @@ EVENT_Q_MAXSIZE = 500
 
 # OCR
 OCR_RESIZE = 3
-OCR_CFG_HEADER = '--oem 1 --psm 7'          # single-line faster + more accurate
-OCR_CFG_HEADER_FALLBACK = '--oem 1 --psm 6' # multi-line fallback
+OCR_CFG_HEADER = '--oem 1 --psm 7'
+OCR_CFG_HEADER_FALLBACK = '--oem 1 --psm 6'
 
-# Sanity ranges for parsed values
+# Sanity ranges
 MAX_OVER = 60
 MAX_THRESHOLD = 3000
 
@@ -272,7 +288,6 @@ def parse_panel_text(text):
     SIDE_RX = r'\b(u[nm]d[ea]r|ov[ea]r|undr|ovr)\b'
     OVER_RX = r'[o0]v[ea]?r\b'
 
-    # Try pattern 1: "<N> over ... <side> <M>"
     for pat in (
         rf'(\d+)(?:\.\d+)?\s*{OVER_RX}\D{{0,50}}?{SIDE_RX}\D{{0,10}}?(\d+)',
         rf'{OVER_RX}\s*(\d+)(?:\.\d+)?\D{{0,50}}?{SIDE_RX}\D{{0,10}}?(\d+)',
@@ -289,7 +304,6 @@ def parse_panel_text(text):
             except (ValueError, TypeError):
                 pass
 
-    # Try pattern 2: "<side> <M> ... <N> over"
     m = re.search(
         rf'{SIDE_RX}\D{{0,10}}?(\d+)\D{{0,50}}?(\d+)(?:\.\d+)?\s*{OVER_RX}', t)
     if m:
@@ -307,7 +321,6 @@ def parse_panel_text(text):
 
 
 def ocr_anchor_text(page):
-    """Read text at the fixed anchor box (for log/verify only)."""
     if not ANCHOR_RECT:
         return ""
     return _ocr_region(page, ANCHOR_RECT['x'], ANCHOR_RECT['y'],
@@ -315,7 +328,6 @@ def ocr_anchor_text(page):
 
 
 def refresh_panels(page):
-    """OCR all red boxes. parse_panel_text handles dynamic over/threshold."""
     global _prev_panel_snapshot
     if not ANCHOR_RECT or not MAPPED_TARGETS:
         return []
@@ -342,7 +354,6 @@ def refresh_panels(page):
     PANEL_CACHE['panels'] = panels
     PANEL_CACHE['ts'] = time.time()
 
-    # Log only when panel state changes (avoid spam)
     snap = tuple((p['over'], p['side'], p['threshold']) for p in panels)
     if snap != _prev_panel_snapshot:
         log(f"[PANELS] {list(snap)}")
@@ -363,12 +374,29 @@ def get_panels(page):
 
 
 # ============================================================
-#  Panel selection: HIGHEST threshold for matching over
+#  Panel selection
 # ============================================================
-def pick_best_panel(panels, target_over):
+def pick_best_panel(panels, target_over, want_side=None):
+    """GENERAL mode: over MUST match + side MUST match.
+    Highest threshold wins among matches."""
     matching = [p for p in panels if p['over'] == target_over]
+    if want_side:
+        matching = [p for p in matching if p['side'] == want_side]
     if not matching:
         return None
+    return max(matching, key=lambda p: p['threshold'])
+
+
+def pick_best_panel_by_side(panels, want_side, reference_over=None):
+    """MULTI mode: side matches only — over number does NOT need to match.
+    Picks panel closest to reference_over (tiebreak: highest threshold)."""
+    matching = [p for p in panels if p['side'] == want_side]
+    if not matching:
+        return None
+    if reference_over is not None:
+        return min(matching,
+                   key=lambda p: (abs(p['over'] - reference_over),
+                                  -p['threshold']))
     return max(matching, key=lambda p: p['threshold'])
 
 
@@ -387,40 +415,57 @@ def click_panel(page, panel):
 
 
 # ============================================================
-#  Event processing (dynamic over/threshold)
+#  Event processing
 # ============================================================
 def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
     global _last_click_at
 
+    # wicket -> under side | 4/6/wide+nb/noball -> over side
+    want_side = 'under' if event_type == 'wicket' else 'over'
+
     t0 = time.perf_counter()
 
-    # Event's over determines target over. Always try current first.
-    # Fallback to next over in case site advanced immediately.
-    target_candidates = [over_num, over_num + 1]
+    # ===== GENERAL MODE: WS over must be <= GENERAL_MAX_OVER =====
+    if not MULTI_MODE and over_num > GENERAL_MAX_OVER:
+        log(f"[GENERAL-SKIP] WS over={over_num} > max={GENERAL_MAX_OVER} "
+            f"(general mode only clicks WS over <= {GENERAL_MAX_OVER})")
+        return False
 
-    # First attempt: read cache / OCR
     panels = get_panels(page)
     best = None
-    for tc in target_candidates:
-        b = pick_best_panel(panels, tc)
-        if b:
-            best = b
-            break
 
-    # Safety net: if nothing matched, force a fresh OCR (cache might be stale)
-    if not best:
-        dbg("no match in current cache - forcing fresh OCR")
-        panels = refresh_panels(page)
-        for tc in target_candidates:
-            b = pick_best_panel(panels, tc)
+    if MULTI_MODE:
+        # MULTI: side-only, any over allowed
+        best = pick_best_panel_by_side(panels, want_side,
+                                       reference_over=over_num)
+    else:
+        # GENERAL: exact over match (WS over, then WS over+1 fallback) + side
+        for tc in (over_num, over_num + 1):
+            b = pick_best_panel(panels, tc, want_side)
             if b:
                 best = b
                 break
 
+    # Fresh OCR fallback
+    if not best:
+        dbg(f"no {want_side} panel in cache - forcing fresh OCR")
+        panels = refresh_panels(page)
+        if MULTI_MODE:
+            best = pick_best_panel_by_side(panels, want_side,
+                                           reference_over=over_num)
+        else:
+            for tc in (over_num, over_num + 1):
+                b = pick_best_panel(panels, tc, want_side)
+                if b:
+                    best = b
+                    break
+
     if not best:
         summary = [(p['over'], p['side'], p['threshold']) for p in panels]
-        log(f"[NO-MATCH] type={event_type} want_overs={target_candidates} "
-            f"visible_panels={summary}")
+        mode_str = ("MULTI(side-only,any-over)" if MULTI_MODE
+                    else f"GENERAL(over={over_num}/{over_num+1},max={GENERAL_MAX_OVER})")
+        log(f"[NO-MATCH] {mode_str} type={event_type} "
+            f"want_side={want_side} visible_panels={summary}")
         return False
 
     # Dedup
@@ -435,16 +480,15 @@ def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
         return False
 
     ms = round((time.perf_counter() - t0) * 1000)
-    log(f"[CLICK] {event_type} -> over={best['over']} "
+    log(f"[CLICK] {event_type}({want_side}) -> over={best['over']} "
         f"{best['side']} {best['threshold']} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
 
     _recent_clicked.append(dedup_key)
     _last_click_at = time.time()
 
-    # Invalidate + pre-warm (short delay so browser processes click state first)
     PANEL_CACHE['ts'] = 0
     try:
-        page.wait_for_timeout(80)     # let panel update
+        page.wait_for_timeout(80)
         refresh_panels(page)
     except Exception:
         pass
@@ -485,7 +529,7 @@ def setup_from_done(page, final_targets):
 
 
 # ============================================================
-#  Calibration UI JS (default 1 row, +1/-1, blue anchor fixed)
+#  Calibration UI JS
 # ============================================================
 SHOW_TARGETS_JS = """
 () => {
@@ -501,7 +545,6 @@ SHOW_TARGETS_JS = """
     let baseY = 400, anchorW = 100, anchorH = 34;
     let leftX = 70, rightX = 425, boxW = 220, boxH = 30, rowGap = 3.34;
 
-    // Blue anchor
     const blueBox = document.createElement('div');
     blueBox.style.cssText = `position:absolute;left:${leftX}px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;border:2px solid #00aaff;background:rgba(0,170,255,0.4);box-sizing:border-box;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:10px;`;
     blueBox.textContent = "Anchor";
@@ -775,9 +818,20 @@ def monitor_and_click():
 
         start_ws_thread()
         log(f"[WS] waiting... (match_key={match_filter})")
-        log(f"   Mode: {'MULTI (fast, 1.5s cache)' if MULTI_MODE else 'SINGLE (fresh OCR)'}")
-        log("   Panel text is DYNAMIC - over/threshold read fresh each time")
-        log("   Wicket/4/6/wide+nb/noball -> click panel with HIGHEST threshold")
+        if MULTI_MODE:
+            log("   Mode: MULTI (fast, 1.5s cache)")
+            log("   * ANY WS over is allowed (no max limit)")
+            log("   * side-only match (over number NOT required)")
+            log("   4/6/wide+nb/noball -> click 'over' side panel")
+            log("   Wicket            -> click 'under' side panel")
+        else:
+            log(f"   Mode: GENERAL/SINGLE (fresh OCR)")
+            log(f"   * WS over MUST be <= {GENERAL_MAX_OVER} "
+                f"(e.g., 18,19,20,21,22,23,24,25 -> click; > {GENERAL_MAX_OVER} -> skip)")
+            log("   * WS over MUST match a panel over (exact, +1 fallback)")
+            log("   * side MUST match")
+            log("   4/6/wide+nb/noball -> click 'over' side panel (matching over)")
+            log("   Wicket            -> click 'under' side panel (matching over)")
         log("   Other events (dot/1/2/3/plain wide) -> skip")
         log(f"   Dedup window: {DEDUP_WINDOW}\n")
 
