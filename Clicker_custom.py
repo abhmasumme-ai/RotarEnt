@@ -1,5 +1,5 @@
 """
-clicker_custom.py - v5 (general: WS over<=panel over | multi: any over)
+clicker_custom.py - v6 (single: per-over re-cal | multi: any over)
 ================================================================================
 
 Key facts:
@@ -9,7 +9,6 @@ Key facts:
         "25 over total run under 136"
         "26 over total run over 141"
     Script re-OCRs boxes every click, parses over + side + threshold fresh.
-    You do NOT touch DONE again during the match.
 
 Click rules (side = under/over read from red box text):
   Wicket                       -> click 'under' side panel
@@ -21,26 +20,27 @@ Click rules (side = under/over read from red box text):
 
 Modes:
   python clicker_custom.py <match_id>
-      GENERAL:
-        * WS over MUST be <= panel's over (read fresh from red box)
-          e.g. panel shows "26 over..." and WS gives over 25 or 26 -> click
-          e.g. panel shows "26 over..." and WS gives over 27 -> skip
-        * side MUST match (wicket=under, 4/6=over)
-        * Among eligible panels: smallest panel.over wins (closest to WS),
-          tiebreak: highest threshold.
+      SINGLE / GENERAL:
+        * Initial DONE once -> panels locked
+        * Per delivery: WS over MUST be <= panel's over (red box)
+                        + side MUST match (wicket=under, 4/6=over)
+                        + smallest panel.over wins (closest), tiebreak highest thr
+        * When over completes (6 balls OR WS over advances):
+            -> redbox shows again -> fix position + click DONE
+            -> script re-reads red box, continues with new over
+        * Same rule applies per over
 
   python clicker_custom.py <match_id> multi
       MULTI:
-        * WS over ANY value (no matching at all)
-        * side-only match (over number NOT required)
-        * Picks panel closest to current WS over (tiebreak: highest thr)
-        * Fastest path.
+        * Initial DONE once -> runs forever
+        * Per delivery: side-only match (over number NOT required)
+        * 4/6 -> 'over' panel, wicket -> 'under' panel
+        * Fastest path (1.5s cache), no re-calibration
 
 Dedup:
   * ONE click per delivery (keyed by over+ball).
-  * If WS retransmits same delivery with different ev text
-    ("4" then "FOUR", "wide" then "wide+4") -> only first click fires.
-  * Consecutive deliveries on same panel -> each clicks (no panel dedup).
+  * Same delivery retransmit ("4" then "FOUR") -> only first click fires.
+  * Consecutive deliveries on same panel -> each clicks.
 
 Env:
   CLICKER_WS_URL / CLICKER_WS_TOKEN / CLICKER_HEADLESS / CLICKER_DEBUG
@@ -127,6 +127,10 @@ _recent_deliveries = collections.deque(maxlen=DEDUP_WINDOW)
 _pending_reset = threading.Event()
 _prev_panel_snapshot = None
 
+# Single-mode per-over state
+_single_current_over = None
+_recal_pending = False
+
 WS_STATE = {"match_filter": "", "up": False, "msg_count": 0, "last_ts": 0.0}
 event_q = queue.Queue(maxsize=EVENT_Q_MAXSIZE)
 _stop_event = threading.Event()
@@ -165,24 +169,20 @@ def classify_event(ev_text):
     if not ev:
         return None
 
-    # Wicket
     if re.match(r'^(wicket|out|w)[.!]*$', ev):
         return 'wicket'
     if re.match(r'^(bowled|lbw|caught|c ?& ?b|run ?out|stumped?|hit ?wicket|'
                 r'retired|handled|obstruct)', ev):
         return 'wicket'
 
-    # No-ball (any variant incl. no-ball wide)
     if re.search(r'\b(no[\s_-]?ball|nb)\b', ev):
         return 'over'
 
-    # Wide (only if +4 or +6, else skip)
     if re.match(r'^wide\b', ev):
         if re.search(r'\b(four|six|4|6)\b', ev):
             return 'over'
         return None
 
-    # Four / Six
     if re.match(r'^(four|six|4|6)\b', ev):
         return 'over'
 
@@ -269,17 +269,6 @@ def _ocr_region(page, x, y, w, h, cfg):
 
 
 def parse_panel_text(text):
-    """
-    DYNAMIC parse - handles any over / any threshold.
-
-    Handles:
-      "25 over total run under 136"
-      "26 over total run over 141"
-      "25.0 over total run under 136"
-      "over 25 total run under 136"
-      "25 ovr total runs undr 136"
-      "total run under 136 at 25 over"
-    """
     if not text:
         return None
     t = re.sub(r'\s+', ' ', text).strip().lower()
@@ -376,19 +365,8 @@ def get_panels(page):
 #  Panel selection
 # ============================================================
 def pick_best_panel_general(panels, ws_over, want_side):
-    """
-    GENERAL mode rule:
-      * panel.over >= WS over  (panel at or ahead of WS over)
-      * side must match        (wicket=under, 4/6=over)
-      * prefer smallest panel.over (closest to WS over)
-      * tiebreak: highest threshold
-
-    Examples with panels showing "26 over ... under 145 / over 150":
-      WS over=26, 4    -> click over 150   (exact)
-      WS over=25, 4    -> click over 150   (25 <= 26)
-      WS over=26, wkt  -> click under 145  (exact)
-      WS over=27, 4    -> NO-MATCH (27 > 26)
-    """
+    """GENERAL: panel.over >= ws_over + side match.
+    Smallest panel.over (closest), then highest threshold."""
     matching = [p for p in panels
                 if p['side'] == want_side and p['over'] >= ws_over]
     if not matching:
@@ -399,8 +377,7 @@ def pick_best_panel_general(panels, ws_over, want_side):
 
 
 def pick_best_panel_by_side(panels, want_side, reference_over=None):
-    """MULTI mode: side-only match — over number NOT required.
-    Picks panel closest to reference_over (tiebreak: highest threshold)."""
+    """MULTI: side-only, closest over, highest thr."""
     matching = [p for p in panels if p['side'] == want_side]
     if not matching:
         return None
@@ -431,22 +408,17 @@ def click_panel(page, panel):
 def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
     global _last_click_at
 
-    # wicket -> under side | 4/6/wide+nb/noball -> over side
     want_side = 'under' if event_type == 'wicket' else 'over'
-
     t0 = time.perf_counter()
     panels = get_panels(page)
     best = None
 
     if MULTI_MODE:
-        # MULTI: side-only, ANY over (no matching)
         best = pick_best_panel_by_side(panels, want_side,
                                        reference_over=over_num)
     else:
-        # GENERAL: WS over <= panel over (redbox) + side match
         best = pick_best_panel_general(panels, over_num, want_side)
 
-    # Fresh OCR fallback
     if not best:
         dbg(f"no {want_side} panel in cache - forcing fresh OCR")
         panels = refresh_panels(page)
@@ -463,9 +435,6 @@ def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
         log(f"[NO-MATCH] {mode_str} type={event_type} "
             f"want_side={want_side} visible_panels={summary}")
         return False
-
-    # NO panel-level dedup — every delivery clicks.
-    # Delivery-level dedup happens in main loop.
 
     cx, cy = click_panel(page, best)
     if cx is None:
@@ -517,6 +486,58 @@ def setup_from_done(page, final_targets):
     for p in panels:
         log(f"      [{p['idx']}] over={p['over']} {p['side']} "
             f"{p['threshold']}  raw={p.get('raw','')!r}")
+
+
+# ============================================================
+#  Single-mode re-calibration (called after over completes)
+# ============================================================
+def wait_for_recalibration(page):
+    """Single mode: after over completes, show calibration UI again
+    and wait for user to click DONE. Returns True on success."""
+    log("[SINGLE] ==========================================")
+    log("[SINGLE] Over complete - RE-CALIBRATION needed")
+    log("[SINGLE] Fix position, then click DONE")
+    log("[SINGLE] ==========================================")
+
+    while not _stop_event.is_set():
+        try:
+            page.evaluate("() => { window.__pw_action = null; }")
+            page.evaluate(SHOW_TARGETS_JS)
+        except Exception as e:
+            log(f"[SINGLE] Recal setup error: {e}")
+            return False
+
+        while not _stop_event.is_set():
+            try:
+                action = page.evaluate("() => window.__pw_action")
+            except Exception as e:
+                log(f"[SINGLE] Recal poll error: {e}")
+                return False
+            if action in ('done', 'update', 'reset'):
+                break
+            page.wait_for_timeout(200)
+
+        if action == 'done':
+            try:
+                final_targets = page.evaluate("() => window.__pw_final_targets")
+                setup_from_done(page, final_targets)
+                _recent_deliveries.clear()
+                log("[SINGLE] Re-calibration done - resuming")
+                return True
+            except Exception as e:
+                log(f"[SINGLE] Recal save error: {e}")
+                return False
+        elif action == 'reset':
+            try:
+                page.evaluate("() => { window.__row_count = 1; }")
+            except Exception:
+                return False
+            continue
+        elif action == 'update':
+            continue
+        else:
+            return False
+    return False
 
 
 # ============================================================
@@ -684,7 +705,7 @@ def start_ws_thread():
 #  Main
 # ============================================================
 def monitor_and_click():
-    global MULTI_MODE
+    global MULTI_MODE, _single_current_over, _recal_pending
 
     if len(sys.argv) < 2:
         print("Usage: python clicker_custom.py <match_key> [multi|single]")
@@ -766,6 +787,7 @@ def monitor_and_click():
         print("Use '+1 Row' / '-1 Row' to adjust. Click DONE once.")
         print("=" * 65 + "\n")
 
+        # ---- Initial calibration (once) ----
         while not _stop_event.is_set():
             try:
                 page.evaluate("() => { window.__pw_action = null; }")
@@ -814,23 +836,35 @@ def monitor_and_click():
             log("   * WS over ANY value (no matching)")
             log("   * side-only: 4/6 -> 'over' panel, wicket -> 'under' panel")
             log("   * picks panel closest to WS over (tiebreak: highest thr)")
+            log("   * runs forever - no re-calibration")
         else:
-            log("   Mode: GENERAL/SINGLE (fresh OCR)")
+            log("   Mode: SINGLE/GENERAL (fresh OCR, per-over re-cal)")
             log("   * WS over MUST be <= panel's over (read from red box)")
             log("   * side MUST match: 4/6 -> 'over', wicket -> 'under'")
-            log("   * among eligible: smallest panel.over wins (closest to WS)")
-            log("   Examples (panel shows 26 over):")
-            log("     WS over=26, 4    -> click 'over' panel (exact)")
-            log("     WS over=25, 4    -> click 'over' panel (25 <= 26)")
-            log("     WS over=27, 4    -> NO-MATCH (27 > 26)")
+            log("   * When over completes (6 balls OR WS over advances):")
+            log("       -> redbox shows again -> fix position + click DONE")
+            log("       -> script re-reads red box, continues with new over")
         log("   Other events (dot/1/2/3/plain wide) -> skip")
         log(f"   Delivery dedup window: {DEDUP_WINDOW} | 1 click per delivery")
         log("")
+
+        _single_current_over = None
+        _recal_pending = False
 
         try:
             while not _stop_event.is_set():
                 check_pending_reset()
 
+                # Single mode: re-calibration pending (from 6-ball signal)
+                if not MULTI_MODE and _recal_pending:
+                    log("[SINGLE] Pending re-calibration (6 balls done)")
+                    if not wait_for_recalibration(page):
+                        break
+                    _recal_pending = False
+                    _single_current_over = None
+                    continue
+
+                # Get next event
                 try:
                     m = event_q.get(timeout=EVENT_TIMEOUT_SEC)
                 except queue.Empty:
@@ -871,14 +905,39 @@ def monitor_and_click():
                 xb_str = f" xball={xball}" if xball is not None else ""
 
                 event_type = classify_event(ev)
+
+                # ---- Single mode: over change -> re-cal BEFORE processing ----
+                if (not MULTI_MODE and _single_current_over is not None
+                        and over_num > _single_current_over):
+                    log(f"[SINGLE] Over changed: {_single_current_over} -> {over_num}")
+                    if not wait_for_recalibration(page):
+                        break
+                    _recent_deliveries.clear()
+                    _single_current_over = None
+
+                # ---- Single mode: stale event check (WS over < panel over) ----
+                if not MULTI_MODE and PANEL_CACHE.get('panels'):
+                    min_po = min(p['over'] for p in PANEL_CACHE['panels'])
+                    if over_num < min_po:
+                        log(f"[SINGLE] Stale event: over {over_num} < "
+                            f"panel over {min_po}, skip")
+                        continue
+
+                # ---- Skip events we don't click on ----
                 if event_type is None:
                     log(f"[EV] ev={ev} | over={m.get('over')} "
                         f"ball={m.get('ball')}{xb_str}{lag_str} -> skip")
+                    if not MULTI_MODE:
+                        if _single_current_over is None:
+                            _single_current_over = over_num
+                        eff = xball if xball is not None else ball
+                        if eff and eff >= 6:
+                            log(f"[SINGLE] Over {over_num} ball {eff} "
+                                f"-> 6 balls done, will re-cal")
+                            _recal_pending = True
                     continue
 
-                # Delivery-level dedup: ONE click per (over, ball).
-                # Same delivery retransmit (different ev text like "4"->"FOUR")
-                # counts as same delivery -> blocked.
+                # ---- Delivery-level dedup ----
                 delivery_key = f"{over_str}|{bkey}"
                 if delivery_key in _recent_deliveries:
                     log(f"[DUP] delivery={delivery_key} ev={ev}")
@@ -893,6 +952,16 @@ def monitor_and_click():
                                   over_num, over_dec, ball, xball)
                 except Exception as e:
                     log(f"[ERR] process_event: {type(e).__name__}: {e}")
+
+                # ---- Single mode: update tracking, detect over completion ----
+                if not MULTI_MODE:
+                    if _single_current_over is None:
+                        _single_current_over = over_num
+                    eff = xball if xball is not None else ball
+                    if eff and eff >= 6:
+                        log(f"[SINGLE] Over {over_num} ball {eff} "
+                            f"-> 6 balls done, will re-cal")
+                        _recal_pending = True
 
         except KeyboardInterrupt:
             print("\nClosing...")
