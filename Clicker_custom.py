@@ -1,5 +1,5 @@
 """
-clicker_custom.py - v4 (general: WS over<=25 + match | multi: any over side-only)
+clicker_custom.py - v5 (general: WS over<=panel over | multi: any over)
 ================================================================================
 
 Key facts:
@@ -22,25 +22,30 @@ Click rules (side = under/over read from red box text):
 Modes:
   python clicker_custom.py <match_id>
       GENERAL:
-        * WS over MUST be <= GENERAL_MAX_OVER (default 25)
-          e.g. WS over 18/19/20/21/22/23/24/25 -> click allowed
-          e.g. WS over 26/27/...               -> skip (no click)
-        * WS over MUST match a panel's over (exact, +1 fallback)
+        * WS over MUST be <= panel's over (read fresh from red box)
+          e.g. panel shows "26 over..." and WS gives over 25 or 26 -> click
+          e.g. panel shows "26 over..." and WS gives over 27 -> skip
         * side MUST match (wicket=under, 4/6=over)
-        * Highest threshold wins.
+        * Among eligible panels: smallest panel.over wins (closest to WS),
+          tiebreak: highest threshold.
 
   python clicker_custom.py <match_id> multi
       MULTI:
-        * WS over ANY value (no max limit) -> click allowed
+        * WS over ANY value (no matching at all)
         * side-only match (over number NOT required)
         * Picks panel closest to current WS over (tiebreak: highest thr)
         * Fastest path.
+
+Dedup:
+  * ONE click per delivery (keyed by over+ball).
+  * If WS retransmits same delivery with different ev text
+    ("4" then "FOUR", "wide" then "wide+4") -> only first click fires.
+  * Consecutive deliveries on same panel -> each clicks (no panel dedup).
 
 Env:
   CLICKER_WS_URL / CLICKER_WS_TOKEN / CLICKER_HEADLESS / CLICKER_DEBUG
   CLICKER_NO_IDLE / CLICKER_MULTI / CLICKER_SITE_URL / CLICKER_MATCH_URL
   CLICKER_PROXY_URL / CLICKER_DEDUP_WINDOW / TESSERACT_CMD
-  CLICKER_GENERAL_MAX_OVER (default 25)
 """
 import asyncio
 import collections
@@ -83,9 +88,6 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# GENERAL mode: WS over must be <= this to allow click
-GENERAL_MAX_OVER = int(os.environ.get("CLICKER_GENERAL_MAX_OVER", "25"))
-
 # Timing
 PANEL_CACHE_FRESH_SEC = 0.3
 PANEL_CACHE_FRESH_SEC_MULTI = 1.5
@@ -121,9 +123,8 @@ ANCHOR_RECT = None
 MAPPED_TARGETS = []
 PANEL_CACHE = {"panels": [], "ts": 0.0}
 _last_click_at = 0.0
-_recent_clicked = collections.deque(maxlen=DEDUP_WINDOW)
+_recent_deliveries = collections.deque(maxlen=DEDUP_WINDOW)
 _pending_reset = threading.Event()
-_last_dedup_key = None
 _prev_panel_snapshot = None
 
 WS_STATE = {"match_filter": "", "up": False, "msg_count": 0, "last_ts": 0.0}
@@ -149,11 +150,9 @@ def handle_reset(from_id, to_id):
 
 
 def check_pending_reset():
-    global _last_dedup_key
     if _pending_reset.is_set():
         _pending_reset.clear()
-        _recent_clicked.clear()
-        _last_dedup_key = None
+        _recent_deliveries.clear()
         log("[RESET] dedup cleared")
 
 
@@ -376,19 +375,31 @@ def get_panels(page):
 # ============================================================
 #  Panel selection
 # ============================================================
-def pick_best_panel(panels, target_over, want_side=None):
-    """GENERAL mode: over MUST match + side MUST match.
-    Highest threshold wins among matches."""
-    matching = [p for p in panels if p['over'] == target_over]
-    if want_side:
-        matching = [p for p in matching if p['side'] == want_side]
+def pick_best_panel_general(panels, ws_over, want_side):
+    """
+    GENERAL mode rule:
+      * panel.over >= WS over  (panel at or ahead of WS over)
+      * side must match        (wicket=under, 4/6=over)
+      * prefer smallest panel.over (closest to WS over)
+      * tiebreak: highest threshold
+
+    Examples with panels showing "26 over ... under 145 / over 150":
+      WS over=26, 4    -> click over 150   (exact)
+      WS over=25, 4    -> click over 150   (25 <= 26)
+      WS over=26, wkt  -> click under 145  (exact)
+      WS over=27, 4    -> NO-MATCH (27 > 26)
+    """
+    matching = [p for p in panels
+                if p['side'] == want_side and p['over'] >= ws_over]
     if not matching:
         return None
-    return max(matching, key=lambda p: p['threshold'])
+    min_over = min(p['over'] for p in matching)
+    candidates = [p for p in matching if p['over'] == min_over]
+    return max(candidates, key=lambda p: p['threshold'])
 
 
 def pick_best_panel_by_side(panels, want_side, reference_over=None):
-    """MULTI mode: side matches only — over number does NOT need to match.
+    """MULTI mode: side-only match — over number NOT required.
     Picks panel closest to reference_over (tiebreak: highest threshold)."""
     matching = [p for p in panels if p['side'] == want_side]
     if not matching:
@@ -424,27 +435,16 @@ def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
     want_side = 'under' if event_type == 'wicket' else 'over'
 
     t0 = time.perf_counter()
-
-    # ===== GENERAL MODE: WS over must be <= GENERAL_MAX_OVER =====
-    if not MULTI_MODE and over_num > GENERAL_MAX_OVER:
-        log(f"[GENERAL-SKIP] WS over={over_num} > max={GENERAL_MAX_OVER} "
-            f"(general mode only clicks WS over <= {GENERAL_MAX_OVER})")
-        return False
-
     panels = get_panels(page)
     best = None
 
     if MULTI_MODE:
-        # MULTI: side-only, any over allowed
+        # MULTI: side-only, ANY over (no matching)
         best = pick_best_panel_by_side(panels, want_side,
                                        reference_over=over_num)
     else:
-        # GENERAL: exact over match (WS over, then WS over+1 fallback) + side
-        for tc in (over_num, over_num + 1):
-            b = pick_best_panel(panels, tc, want_side)
-            if b:
-                best = b
-                break
+        # GENERAL: WS over <= panel over (redbox) + side match
+        best = pick_best_panel_general(panels, over_num, want_side)
 
     # Fresh OCR fallback
     if not best:
@@ -454,36 +454,27 @@ def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
             best = pick_best_panel_by_side(panels, want_side,
                                            reference_over=over_num)
         else:
-            for tc in (over_num, over_num + 1):
-                b = pick_best_panel(panels, tc, want_side)
-                if b:
-                    best = b
-                    break
+            best = pick_best_panel_general(panels, over_num, want_side)
 
     if not best:
         summary = [(p['over'], p['side'], p['threshold']) for p in panels]
-        mode_str = ("MULTI(side-only,any-over)" if MULTI_MODE
-                    else f"GENERAL(over={over_num}/{over_num+1},max={GENERAL_MAX_OVER})")
+        mode_str = ("MULTI(side-only)" if MULTI_MODE
+                    else f"GENERAL(ws_over={over_num}, panel_over>={over_num})")
         log(f"[NO-MATCH] {mode_str} type={event_type} "
             f"want_side={want_side} visible_panels={summary}")
         return False
 
-    # Dedup
-    dedup_key = (best['over'], best['side'], best['threshold'])
-    if dedup_key in _recent_clicked:
-        log(f"[ALREADY-CLICKED] panel={dedup_key}")
-        return False
+    # NO panel-level dedup — every delivery clicks.
+    # Delivery-level dedup happens in main loop.
 
-    # Click
     cx, cy = click_panel(page, best)
     if cx is None:
         return False
 
     ms = round((time.perf_counter() - t0) * 1000)
-    log(f"[CLICK] {event_type}({want_side}) -> over={best['over']} "
+    log(f"[CLICK] {event_type}({want_side}) -> panel over={best['over']} "
         f"{best['side']} {best['threshold']} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
 
-    _recent_clicked.append(dedup_key)
     _last_click_at = time.time()
 
     PANEL_CACHE['ts'] = 0
@@ -693,7 +684,7 @@ def start_ws_thread():
 #  Main
 # ============================================================
 def monitor_and_click():
-    global MULTI_MODE, _last_dedup_key
+    global MULTI_MODE
 
     if len(sys.argv) < 2:
         print("Usage: python clicker_custom.py <match_key> [multi|single]")
@@ -820,22 +811,21 @@ def monitor_and_click():
         log(f"[WS] waiting... (match_key={match_filter})")
         if MULTI_MODE:
             log("   Mode: MULTI (fast, 1.5s cache)")
-            log("   * ANY WS over is allowed (no max limit)")
-            log("   * side-only match (over number NOT required)")
-            log("   4/6/wide+nb/noball -> click 'over' side panel")
-            log("   Wicket            -> click 'under' side panel")
+            log("   * WS over ANY value (no matching)")
+            log("   * side-only: 4/6 -> 'over' panel, wicket -> 'under' panel")
+            log("   * picks panel closest to WS over (tiebreak: highest thr)")
         else:
-            log(f"   Mode: GENERAL/SINGLE (fresh OCR)")
-            log(f"   * WS over MUST be <= {GENERAL_MAX_OVER} "
-                f"(e.g., 18,19,20,21,22,23,24,25 -> click; > {GENERAL_MAX_OVER} -> skip)")
-            log("   * WS over MUST match a panel over (exact, +1 fallback)")
-            log("   * side MUST match")
-            log("   4/6/wide+nb/noball -> click 'over' side panel (matching over)")
-            log("   Wicket            -> click 'under' side panel (matching over)")
+            log("   Mode: GENERAL/SINGLE (fresh OCR)")
+            log("   * WS over MUST be <= panel's over (read from red box)")
+            log("   * side MUST match: 4/6 -> 'over', wicket -> 'under'")
+            log("   * among eligible: smallest panel.over wins (closest to WS)")
+            log("   Examples (panel shows 26 over):")
+            log("     WS over=26, 4    -> click 'over' panel (exact)")
+            log("     WS over=25, 4    -> click 'over' panel (25 <= 26)")
+            log("     WS over=27, 4    -> NO-MATCH (27 > 26)")
         log("   Other events (dot/1/2/3/plain wide) -> skip")
-        log(f"   Dedup window: {DEDUP_WINDOW}\n")
-
-        _last_dedup_key = None
+        log(f"   Delivery dedup window: {DEDUP_WINDOW} | 1 click per delivery")
+        log("")
 
         try:
             while not _stop_event.is_set():
@@ -869,11 +859,6 @@ def monitor_and_click():
 
                 over_str = str(m.get("over", ""))
                 bkey = m.get("xball") or m.get("ball") or ""
-                dedup_key = f"{over_str}|{bkey}|{ev}"
-                if dedup_key == _last_dedup_key:
-                    log(f"[DUP] {dedup_key}")
-                    continue
-                _last_dedup_key = dedup_key
 
                 over_num, over_dec, ball, xball = parse_over_ball(m)
                 if over_num is None:
@@ -890,6 +875,15 @@ def monitor_and_click():
                     log(f"[EV] ev={ev} | over={m.get('over')} "
                         f"ball={m.get('ball')}{xb_str}{lag_str} -> skip")
                     continue
+
+                # Delivery-level dedup: ONE click per (over, ball).
+                # Same delivery retransmit (different ev text like "4"->"FOUR")
+                # counts as same delivery -> blocked.
+                delivery_key = f"{over_str}|{bkey}"
+                if delivery_key in _recent_deliveries:
+                    log(f"[DUP] delivery={delivery_key} ev={ev}")
+                    continue
+                _recent_deliveries.append(delivery_key)
 
                 log(f"[EV] ev={ev} | over={m.get('over')} over_dec={over_dec} "
                     f"ball={m.get('ball')}{xb_str}{lag_str} -> {event_type}")
