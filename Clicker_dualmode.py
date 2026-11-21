@@ -1,8 +1,8 @@
 """
-clicker.py - v17 (merged: v15 single-exact + multi-candidate, bug-fixed)
-=======================================================================
+clicker.py - v18 (v17 + post-click pre-warm + multi fast-dedup + fast constants)
+================================================================================
 Modes:
-  - Single-exact (default, v15 behavior):
+  - Single-exact (default):
         python clicker.py <match_id>
         want = (over+1, xball|ball)  -- only this exact panel is clicked
 
@@ -13,15 +13,22 @@ Modes:
         raw "3.6" -> click 4-6 OR 5-1   <- over boundary
         raw "4.1" -> click 5-1 OR 5-2   <- over boundary (next over)
 
-v17 fixes over v16:
-  1. Multi-mode dedup: panel-level (not candidate-overlap) => 3.6->4.1 no longer skipped
-  2. Dedup key includes ball/xball (consecutive dots no longer collide)
-  3. str(m.get("over", "")) instead of str(m.get("over") or "") => over=0 works
-  4. max_boxes = len(final_targets) => all calibrated rows used (was capped at 3)
-  5. Calibration loop crash-proof (action=None + try/except)
-  6. _last_dedup_key cleared on RESET
-  7. Removed duplicate is_intermediate check
-  8. _recent_clicked used in BOTH modes for actual panel value
+v18 changes over v17:
+  1. Post-click pre-warm: refresh_panel_header() runs immediately after click
+     so the NEXT event hits the cache fast-path (<20ms instead of 60-170ms).
+  2. POST_CLICK_COOLDOWN 0.3 -> 0.1 (pre-warm removes need for long cooldown).
+  3. EVENT_TIMEOUT_SEC 0.05 -> 0.01 (lower idle wake latency).
+  4. Multi-mode fast pre-dedup: if ALL candidates already clicked, skip OCR.
+  5. Idle-refresh skipped when recent WS activity (<1s) to avoid blocking loop.
+
+v17 fixes retained:
+  - Multi-mode panel-level dedup (3.6->4.1 no longer skipped)
+  - Dedup key includes ball/xball
+  - str(m.get("over", "")) -> over=0 works
+  - max_boxes = len(final_targets)
+  - Calibration loop crash-proof
+  - _last_dedup_key cleared on RESET
+  - _recent_clicked stores ACTUAL panel value in BOTH modes
 
 Compatibility with main.py v8/v9/v10:
   - Binary WS frames (bytes + str)
@@ -83,13 +90,14 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# Timing - fastest pipeline settings
+# Timing - fastest pipeline settings (v18 tightened)
 CACHE_FRESH_SEC = 0.5
 IDLE_REFRESH_SEC = 0.4
 ANCHOR_TRUST_SEC = 60
-EVENT_TIMEOUT_SEC = 0.05
-POST_CLICK_COOLDOWN = 0.3
+EVENT_TIMEOUT_SEC = 0.01         # v18: was 0.05
+POST_CLICK_COOLDOWN = 0.1        # v18: was 0.3
 EVENT_Q_MAXSIZE = 500
+IDLE_SKIP_WS_RECENT_SEC = 1.0    # v18: skip idle OCR if WS active within 1s
 
 # OCR
 COMPARE_THRESHOLD = 0.70
@@ -266,7 +274,6 @@ def setup_from_done(page, final_targets):
 
     MAPPED_TARGETS.clear()
     KNOWN_LINES = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
-    # FIX #4: use ALL calibrated targets, not just first 3 rows
     max_boxes = len(final_targets)
 
     for i, t in enumerate(final_targets[:max_boxes]):
@@ -584,10 +591,13 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
         return False
 
     # Single-mode fast pre-dedup: if exact want already clicked, skip entirely.
-    # (Multi-mode CANNOT use this: overlap between consecutive candidate sets
-    #  is expected, e.g. 3.6 -> (4,6),(5,1) then 4.1 -> (5,1),(5,2).)
     if not MULTI_MODE and cands[0] in _recent_clicked:
         log(f"[ALREADY-CLICKED] ({cand_str})")
+        return False
+
+    # v18: Multi-mode fast pre-dedup — if ALL candidates already clicked, skip.
+    if MULTI_MODE and all(c in _recent_clicked for c in cands):
+        log(f"[ALREADY-CLICKED-ALL] {cand_str}")
         return False
 
     target_box = find_target(side_want, line_want)
@@ -603,7 +613,6 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
             return False
         if (po, pd) not in cands:
             return False
-        # FIX #1: panel-level dedup — this is what fixes 3.6->4.1
         if (po, pd) in _recent_clicked:
             log(f"[ALREADY-CLICKED] panel {po}-{pd} (in dedup window)")
             return False
@@ -615,10 +624,22 @@ def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
         log(f"[CLICK-{source}] panel={po}-{pd} "
             f"target={side_want} {line_want} "
             f"@({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        # FIX #1: record ACTUAL panel value in _recent_clicked (both modes)
         _recent_clicked.append((po, pd))
         _last_click_at = time.time()
-        panel_cache["ts"] = 0    # invalidate cache — panel has advanced
+        panel_cache["ts"] = 0    # invalidate — panel has advanced
+
+        # v18: post-click pre-warm — re-read panel immediately so the NEXT
+        # event hits the cache fast-path instead of paying full OCR latency.
+        # Best-effort: if it reads stale, the next event's slow path corrects it.
+        try:
+            axw = panel_cache["ax"]
+            ayw = panel_cache["ay"]
+            if axw is not None and ayw is not None:
+                txw = axw + (target_box["x"] - ANCHOR_LEFT)
+                tyw = ayw + (target_box["y"] - ANCHOR_TOP)
+                refresh_panel_header(page, axw, ayw, txw, tyw, target_box["h"])
+        except Exception:
+            pass
         return True
 
     # Fast path: cache hit (cache populated by a recent idle-refresh OCR)
@@ -842,7 +863,6 @@ def monitor_and_click():
         print("Click 'DONE' when ready")
         print("=" * 65 + "\n")
 
-        # FIX #5: calibration loop is now crash-proof
         while not _stop_event.is_set():
             try:
                 page.evaluate("() => { window.__pw_action = null; }")
@@ -877,7 +897,6 @@ def monitor_and_click():
             elif action == 'update':
                 continue
             else:
-                # action == None or browser closed
                 break
 
         if not MAPPED_TARGETS:
@@ -916,6 +935,10 @@ def monitor_and_click():
                         continue
                     if time.time() - _last_click_at < POST_CLICK_COOLDOWN:
                         continue
+                    # v18: skip idle OCR if recent WS activity (avoid blocking
+                    # the main loop right after events were just processed).
+                    if time.time() - WS_STATE["last_ts"] < IDLE_SKIP_WS_RECENT_SEC:
+                        continue
                     age = time.time() - panel_cache["ts"]
                     if age < IDLE_REFRESH_SEC:
                         continue
@@ -937,7 +960,7 @@ def monitor_and_click():
                     _last_dedup_key = None
                     continue
 
-                # FIX #2 + #3: dedup key includes ball/xball; safe over stringify
+                # dedup key includes ball/xball; safe over stringify
                 over_str = str(m.get("over", ""))
                 bkey = m.get("xball") or m.get("ball") or ""
                 dedup_key = f"{over_str}|{bkey}|{ev}"
