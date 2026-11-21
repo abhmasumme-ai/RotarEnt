@@ -1,41 +1,30 @@
 """
-clicker.py - v26 (v25 dynamic Under-finder, bugs fixed)
-========================================================
-On wicket from WS:
-  1. Find anchor
-  2. Scan combined region for "Under" text (dynamic, top or bottom row)
-  3. Click wherever "Under" is found
-  4. Cache "under" text template -> future wickets use fast template match
-  5. One click per wicket (1.5s throttle on success only)
-
-Modes (both behave the same; arg accepted for compatibility):
-  python clicker.py <match_id>          -> single
-  python clicker.py <match_id> multi    -> multi (same behavior, logs mode)
-
-v26 fixes over v25:
-  1. Red boxes EMPTY (no text inside) - legend moved ABOVE box
-  2. "multi" CLI argument accepted + logged
-  3. Dedup key includes ball/xball (two wickets same over no longer collide)
-  4. str(m.get("over", "")) - over=0 works
-  5. _last_dedup_key module-level - reset on RESET
-  6. Wicket throttle set ONLY on successful click (retry allowed on fail)
-  7. Calibration loop crash-proof (try/except on page.evaluate)
-  8. _last_wicket_time reset on RESET
-  9. OCR_UPSCALE default 3 (configurable via env) - catches small "Under"
+clicker.py - v27 (FASTEST wicket click)
+========================================
+Speed design:
+  • At calibration: pre-warm Under position → cache rel offset from anchor
+  • Wicket:  anchor(cached) + offset → click  (≈5-10ms, no OCR, no screenshot)
+  • Every 10th wicket: verify via template match (~40ms) to detect panel drift
+  • First wicket if pre-warm failed: OCR scan (~300ms), then cached forever
+  • Throttle 0.5s on success only
+  • Event queue 2000 (no overflow drops)
+  • Fuzzy "Under" OCR (catches Undr / Undar / Uinder)
+  • One click per wicket, WS watches every delivery, acts only on wickets
 
 Env:
-  CLICKER_WS_URL                default ws://127.0.0.1:5000/ws
-  CLICKER_WS_TOKEN              optional WS auth token
-  CLICKER_HEADLESS              1 = headless browser
-  CLICKER_DEBUG                 1 = verbose
-  CLICKER_SITE_URL              optional (else prompt)
-  CLICKER_MATCH_URL             optional (else prompt)
-  CLICKER_PROXY_URL             optional proxy URL
-  CLICKER_TEMPLATE_THRESHOLD    default 0.82
-  CLICKER_OCR_UPSCALE           default 3
-  TESSERACT_CMD                 custom tesseract path
+  CLICKER_WS_URL, CLICKER_WS_TOKEN
+  CLICKER_SITE_URL, CLICKER_MATCH_URL, CLICKER_PROXY_URL
+  CLICKER_HEADLESS=1  CLICKER_DEBUG=1
+  CLICKER_TEMPLATE_THRESHOLD=0.75
+  CLICKER_OCR_UPSCALE=2
+  CLICKER_WICKET_THROTTLE_S=0.5
+  CLICKER_VERIFY_EVERY=10
+  CLICKER_EVENT_Q_MAXSIZE=2000
+  CLICKER_ANCHOR_TRUST_SEC=600
+  TESSERACT_CMD
 """
 import asyncio
+import difflib
 import json
 import os
 import queue
@@ -57,55 +46,51 @@ import pytesseract
 # ============================================================
 _WS_URL_BASE = os.environ.get("CLICKER_WS_URL", "ws://127.0.0.1:5000/ws")
 _WS_TOKEN = os.environ.get("CLICKER_WS_TOKEN", "").strip()
-if _WS_TOKEN:
-    _sep = "&" if "?" in _WS_URL_BASE else "?"
-    WS_URL = f"{_WS_URL_BASE}{_sep}token={urllib.parse.quote(_WS_TOKEN)}"
-else:
-    WS_URL = _WS_URL_BASE
+WS_URL = (_WS_URL_BASE + ("&" if "?" in _WS_URL_BASE else "?")
+          + "token=" + urllib.parse.quote(_WS_TOKEN)) if _WS_TOKEN else _WS_URL_BASE
 
 RECONNECT_SEC = 3
 PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 DEBUG = os.environ.get("CLICKER_DEBUG") == "1"
-TEMPLATE_MATCH_THRESHOLD = float(os.environ.get("CLICKER_TEMPLATE_THRESHOLD", "0.82"))
-OCR_UPSCALE = int(os.environ.get("CLICKER_OCR_UPSCALE", "3"))   # FIX #9
+
+TEMPLATE_MATCH_THRESHOLD = float(os.environ.get("CLICKER_TEMPLATE_THRESHOLD", "0.75"))
+OCR_UPSCALE = int(os.environ.get("CLICKER_OCR_UPSCALE", "2"))
+WICKET_THROTTLE_S = float(os.environ.get("CLICKER_WICKET_THROTTLE_S", "0.5"))
+VERIFY_EVERY = int(os.environ.get("CLICKER_VERIFY_EVERY", "10"))
+EVENT_Q_MAXSIZE = int(os.environ.get("CLICKER_EVENT_Q_MAXSIZE", "2000"))
+ANCHOR_TRUST_SEC = int(os.environ.get("CLICKER_ANCHOR_TRUST_SEC", "600"))
+
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-# Timing
-ANCHOR_TRUST_SEC = 300
 EVENT_TIMEOUT_SEC = 0.05
-EVENT_Q_MAXSIZE = 500
-WICKET_THROTTLE_S = 1.5
 COMPARE_THRESHOLD = 0.70
 CACHE_VERIFY_THRESHOLD = 0.82
-
-# OCR
-OCR_CFG_HEADER = '--oem 1 --psm 7'
 OCR_CFG_MULTI = '--oem 1 --psm 6'
+OCR_CFG_HEADER = '--oem 1 --psm 7'
 
 # Viewport
-VIEW_W = 1080
-VIEW_H = 797
-WIN_W = VIEW_W + 100
-WIN_H = VIEW_H + 120
+VIEW_W, VIEW_H = 1080, 797
+WIN_W, WIN_H = VIEW_W + 100, VIEW_H + 120
 
-ANCHOR_LEFT = 70
-ANCHOR_TOP = 400
-ANCHOR_W = 240
-ANCHOR_H = 34
+ANCHOR_LEFT, ANCHOR_TOP, ANCHOR_W, ANCHOR_H = 70, 400, 240, 34
 
-# State
+# ============================================================
+#  State
+# ============================================================
 ANCHOR_TEMPLATE = {}
 MAPPED_TARGETS = []
 UNDER_TEMPLATE = {}
+UNDER_REL_POS = None              # ★ (dx, dy) from anchor top-left — the fast cache
 CALIBRATED_ANCHOR_POS = None
 last_anchor_pos = None
 _anchor_trust_until = 0.0
 _last_wicket_time = 0.0
-_last_dedup_key = None       # FIX #5: module-level
+_last_dedup_key = None
+_wicket_click_count = 0
 
 _pending_reset = threading.Event()
 _stop_event = threading.Event()
@@ -149,18 +134,31 @@ def handle_reset(from_id, to_id):
 
 
 def check_pending_reset():
-    """Called from main thread. Clear all caches + dedup state."""
-    global _last_dedup_key, _last_wicket_time
+    global _last_dedup_key, _last_wicket_time, UNDER_REL_POS, _wicket_click_count
     if _pending_reset.is_set():
         _pending_reset.clear()
         UNDER_TEMPLATE.clear()
+        UNDER_REL_POS = None
         _last_dedup_key = None
         _last_wicket_time = 0.0
-        log("[RESET] template cache + dedup + throttle cleared")
+        _wicket_click_count = 0
+        log("[RESET] under cache + dedup + throttle cleared")
+
+
+def _is_under_word(w):
+    """Fuzzy match: 'Under', 'Undr', 'Undar', 'Uinder', 'UNDER' all match."""
+    w = (w or "").lower().strip()
+    if not w:
+        return False
+    if 'under' in w:
+        return True
+    if 4 <= len(w) <= 7:
+        return difflib.SequenceMatcher(None, w, 'under').ratio() >= 0.7
+    return False
 
 
 # ============================================================
-#  Calibration UI (JS) - red boxes EMPTY, legend ABOVE box
+#  Calibration UI (JS)
 # ============================================================
 SHOW_TARGETS_JS = """
 () => {
@@ -174,7 +172,6 @@ SHOW_TARGETS_JS = """
     box.innerHTML = '';
     let baseY = 400, anchorW = 240, anchorH = 34, leftX = 70, boxW = 420, boxH = 30, rowGap = 4;
 
-    // Anchor (blue)
     const blueBox = document.createElement('div');
     blueBox.style.cssText = `position:absolute;left:${leftX}px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;border:2px solid #00aaff;background:rgba(0,170,255,0.4);box-sizing:border-box;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:10px;`;
     blueBox.textContent = "Anchor";
@@ -183,24 +180,20 @@ SHOW_TARGETS_JS = """
     let y1 = baseY + anchorH;
     let y2 = y1 + boxH + rowGap;
 
-    // Legend above box1 (NOT inside)
     const legend1 = document.createElement('div');
     legend1.textContent = "OVER";
     legend1.style.cssText = `position:absolute;left:${leftX}px;top:${y1 - 16}px;color:red;font-size:11px;font-weight:bold;`;
     box.appendChild(legend1);
 
-    // Empty red box 1 (OVER)
     const box1 = document.createElement('div');
     box1.style.cssText = `position:absolute;left:${leftX}px;top:${y1}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
     box.appendChild(box1);
 
-    // Legend above box2 (NOT inside)
     const legend2 = document.createElement('div');
     legend2.textContent = "UNDER";
     legend2.style.cssText = `position:absolute;left:${leftX}px;top:${y2 - 16}px;color:red;font-size:11px;font-weight:bold;`;
     box.appendChild(legend2);
 
-    // Empty red box 2 (UNDER)
     const box2 = document.createElement('div');
     box2.style.cssText = `position:absolute;left:${leftX}px;top:${y2}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
     box.appendChild(box2);
@@ -238,7 +231,8 @@ def setup_from_done(page, final_targets):
     raw = page.screenshot(type="png", scale="css")
     src_img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
 
-    anchor_img = src_img[ANCHOR_TOP:ANCHOR_TOP + ANCHOR_H, ANCHOR_LEFT:ANCHOR_LEFT + ANCHOR_W]
+    anchor_img = src_img[ANCHOR_TOP:ANCHOR_TOP + ANCHOR_H,
+                         ANCHOR_LEFT:ANCHOR_LEFT + ANCHOR_W]
     ANCHOR_TEMPLATE.update({"img": anchor_img, "w": ANCHOR_W, "h": ANCHOR_H})
     res = cv2.matchTemplate(src_img, anchor_img, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
@@ -253,10 +247,34 @@ def setup_from_done(page, final_targets):
         MAPPED_TARGETS.append({
             "side": t.get('side'),
             "x": int(t['x']), "y": int(t['y']),
-            "w": int(t['w']), "h": int(t['h'])
+            "w": int(t['w']), "h": int(t['h']),
         })
+    log(f"   Mapped {len(MAPPED_TARGETS)} boxes")
 
-    log(f"   Mapped {len(MAPPED_TARGETS)} boxes total")
+
+def prewarm_under_position(page, retries=3):
+    """★ v27 core: scan for Under ONCE at calibration, cache relative offset."""
+    global UNDER_REL_POS
+    for attempt in range(retries):
+        ax, ay = find_anchor_fast(page)
+        if ax is None:
+            if attempt < retries - 1:
+                page.wait_for_timeout(400)
+                continue
+            log("[PREWARM] no anchor")
+            return False
+        pos = _find_under_once(page, ax, ay)
+        if pos is None:
+            if attempt < retries - 1:
+                page.wait_for_timeout(400)
+                continue
+            log("[PREWARM] Under not found")
+            return False
+        UNDER_REL_POS = (pos[0] - ax, pos[1] - ay)
+        log(f"[PREWARM] ✓ Under cached: rel=({UNDER_REL_POS[0]:.0f},"
+            f"{UNDER_REL_POS[1]:.0f}) attempt={attempt+1}")
+        return True
+    return False
 
 
 # ============================================================
@@ -276,7 +294,8 @@ def find_anchor_fast(page):
                 type="png", scale="css")
             crop = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
             if crop is not None and crop.shape == ANCHOR_TEMPLATE["img"].shape:
-                res = cv2.matchTemplate(crop, ANCHOR_TEMPLATE["img"], cv2.TM_CCOEFF_NORMED)
+                res = cv2.matchTemplate(crop, ANCHOR_TEMPLATE["img"],
+                                        cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(res)
                 if max_val >= CACHE_VERIFY_THRESHOLD:
                     _anchor_trust_until = now + ANCHOR_TRUST_SEC
@@ -299,15 +318,14 @@ def find_anchor_fast(page):
 
 
 # ============================================================
-#  Dynamic Under-finder
+#  "Under" finder (only used by prewarm + verify + first-wicket fallback)
 # ============================================================
 def _combined_region(ax, ay):
     if not MAPPED_TARGETS:
         return None
     xs = [ax + (t["x"] - ANCHOR_LEFT) for t in MAPPED_TARGETS]
     ys = [ay + (t["y"] - ANCHOR_TOP) for t in MAPPED_TARGETS]
-    min_x = int(min(xs))
-    min_y = int(min(ys))
+    min_x = int(min(xs)); min_y = int(min(ys))
     max_x = int(max(x + t["w"] for x, t in zip(xs, MAPPED_TARGETS)))
     max_y = int(max(y + t["h"] for y, t in zip(ys, MAPPED_TARGETS)))
     if max_x <= min_x or max_y <= min_y:
@@ -315,71 +333,82 @@ def _combined_region(ax, ay):
     return min_x, min_y, max_x - min_x, max_y - min_y
 
 
-def find_under_position(page, ax, ay):
-    """Screenshot combined region, template-match or OCR for 'Under' text."""
+def _find_under_once(page, ax, ay):
+    """One-shot scan of combined region → Under center (absolute coords) or None."""
     region = _combined_region(ax, ay)
     if region is None:
         return None
-    min_x, min_y, region_w, region_h = region
-
+    min_x, min_y, rw, rh = region
+    t0 = time.perf_counter()
     try:
         raw = page.screenshot(
-            clip={"x": min_x, "y": min_y, "width": region_w, "height": region_h},
+            clip={"x": min_x, "y": min_y, "width": rw, "height": rh},
             type="png", scale="css")
         img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
         if img is None:
             return None
 
-        # Fast path: template match
+        # 1) template fast-match (if cached from earlier OCR)
         tpl = UNDER_TEMPLATE.get("img")
         if (tpl is not None
                 and tpl.shape[0] <= img.shape[0]
                 and tpl.shape[1] <= img.shape[1]):
             res = cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            if max_val >= TEMPLATE_MATCH_THRESHOLD:
-                cx = min_x + max_loc[0] + tpl.shape[1] / 2
-                cy = min_y + max_loc[1] + tpl.shape[0] / 2
-                dbg(f"template match conf={max_val:.2f}")
+            _, mv, _, ml = cv2.minMaxLoc(res)
+            if mv >= TEMPLATE_MATCH_THRESHOLD:
+                cx = min_x + ml[0] + tpl.shape[1] / 2
+                cy = min_y + ml[1] + tpl.shape[0] / 2
+                dbg(f"find_under: template conf={mv:.2f} {round((time.perf_counter()-t0)*1000)}ms")
                 return (cx, cy)
 
-        # Slow path: OCR once
-        scale = OCR_UPSCALE
-        big = cv2.resize(img, None, fx=scale, fy=scale,
+        # 2) OCR scan
+        big = cv2.resize(img, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
                          interpolation=cv2.INTER_CUBIC)
         data = pytesseract.image_to_data(
-            big, config=OCR_CFG_MULTI, output_type=pytesseract.Output.DICT
-        )
+            big, config=OCR_CFG_MULTI, output_type=pytesseract.Output.DICT)
 
+        best = None
+        best_score = 0.0
         for i, word in enumerate(data['text']):
-            if 'under' in word.lower().strip():
-                wx = data['left'][i] / scale
-                wy = data['top'][i] / scale
-                ww = data['width'][i] / scale
-                wh = data['height'][i] / scale
+            if not _is_under_word(word):
+                continue
+            wx = data['left'][i] / OCR_UPSCALE
+            wy = data['top'][i] / OCR_UPSCALE
+            ww = data['width'][i] / OCR_UPSCALE
+            wh = data['height'][i] / OCR_UPSCALE
+            score = float(data['conf'][i]) if data['conf'][i] != '-1' else 0.0
+            if score >= best_score:
+                best_score = score
+                best = (wx, wy, ww, wh)
 
-                # Cache template
-                pad = 2
-                tx1 = max(0, int(wx) - pad)
-                ty1 = max(0, int(wy) - pad)
-                tx2 = min(img.shape[1], int(wx + ww) + pad)
-                ty2 = min(img.shape[0], int(wy + wh) + pad)
-                if tx2 > tx1 and ty2 > ty1 and (tx2 - tx1) >= 10 and (ty2 - ty1) >= 6:
-                    UNDER_TEMPLATE["img"] = img[ty1:ty2, tx1:tx2].copy()
+        if best is None:
+            dbg(f"find_under: OCR miss {round((time.perf_counter()-t0)*1000)}ms")
+            return None
 
-                cx = min_x + wx + ww / 2
-                cy = min_y + wy + wh / 2
-                dbg(f"OCR found 'under' -> ({cx:.0f},{cy:.0f})")
-                return (cx, cy)
+        wx, wy, ww, wh = best
+        pad = 2
+        tx1 = max(0, int(wx) - pad); ty1 = max(0, int(wy) - pad)
+        tx2 = min(img.shape[1], int(wx + ww) + pad)
+        ty2 = min(img.shape[0], int(wy + wh) + pad)
+        if tx2 > tx1 and ty2 > ty1 and (tx2 - tx1) >= 10 and (ty2 - ty1) >= 6:
+            UNDER_TEMPLATE["img"] = img[ty1:ty2, tx1:tx2].copy()
+
+        cx = min_x + wx + ww / 2
+        cy = min_y + wy + wh / 2
+        dbg(f"find_under: OCR hit conf={best_score:.0f} "
+            f"{round((time.perf_counter()-t0)*1000)}ms")
+        return (cx, cy)
     except Exception as e:
-        log(f"[WARN] find_under_position error: {e}")
-
+        log(f"[WARN] find_under error: {e}")
     return None
 
 
+# ============================================================
+#  Clicking
+# ============================================================
 def do_click_xy(page, cx, cy):
     try:
-        page.mouse.click(cx, cy, delay=random.randint(2, 5))
+        page.mouse.click(cx, cy, delay=random.randint(1, 3))
     except Exception as e:
         log(f"   Click error: {e}")
         return None, None
@@ -389,54 +418,78 @@ def do_click_xy(page, cx, cy):
 def do_click_box(page, box, ax, ay):
     x = ax + (box["x"] - ANCHOR_LEFT)
     y = ay + (box["y"] - ANCHOR_TOP)
-    cx = x + box["w"] / 2
-    cy = y + box["h"] / 2
-    return do_click_xy(page, cx, cy)
+    return do_click_xy(page, x + box["w"] / 2, y + box["h"] / 2)
 
 
 # ============================================================
-#  Wicket handling (throttle set ONLY on success - FIX #6)
+#  Wicket handler  ——  FAST (cached) + SLOW (verify/scan) + FALLBACK
 # ============================================================
 def handle_wicket(page):
-    global _last_wicket_time
+    global _last_wicket_time, UNDER_REL_POS, _wicket_click_count
     t0 = time.perf_counter()
 
+    # throttle (success-only semantics — only set after a successful click)
     if time.time() - _last_wicket_time < WICKET_THROTTLE_S:
-        dbg("wicket throttle - skipping")
+        dbg("wicket throttle")
         return False
 
+    _wicket_click_count += 1
+    need_verify = (VERIFY_EVERY > 0 and _wicket_click_count % VERIFY_EVERY == 0)
+
+    # ---------- FAST PATH (~5-10ms) ----------
+    if UNDER_REL_POS is not None and not need_verify:
+        ax, ay = find_anchor_fast(page)
+        if ax is not None:
+            cx = ax + UNDER_REL_POS[0]
+            cy = ay + UNDER_REL_POS[1]
+            r = do_click_xy(page, cx, cy)
+            if r[0] is not None:
+                _last_wicket_time = time.time()
+                ms = round((time.perf_counter() - t0) * 1000)
+                log(f"[CLICK-INSTANT] UNDER @({cx:.0f},{cy:.0f}) [+{ms}ms]")
+                return True
+        UNDER_REL_POS = None   # anchor lost or click failed → fall through
+
+    # ---------- SLOW PATH: verify or scan ----------
     ax, ay = find_anchor_fast(page)
     if ax is None:
-        log("[NO-ANCHOR] anchor not found")
-        return False   # throttle NOT set -> retry allowed
+        log("[NO-ANCHOR]")
+        return False
 
-    # Fast path: dynamic "under" finder
-    pos = find_under_position(page, ax, ay)
+    pos = _find_under_once(page, ax, ay)
     if pos is not None:
-        cx, cy = do_click_xy(page, pos[0], pos[1])
-        if cx is None:
-            return False
-        _last_wicket_time = time.time()   # FIX #6: only on success
-        ms = round((time.perf_counter() - t0) * 1000)
-        log(f"[CLICK] UNDER @({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        return True
+        new_rel = (pos[0] - ax, pos[1] - ay)
+        if need_verify and UNDER_REL_POS is not None:
+            drift = ((new_rel[0] - UNDER_REL_POS[0]) ** 2
+                     + (new_rel[1] - UNDER_REL_POS[1]) ** 2) ** 0.5
+            log(f"[VERIFY] drift={drift:.1f}px old={UNDER_REL_POS} new={new_rel}")
+        UNDER_REL_POS = new_rel
 
-    # Fallback: configured UNDER box
+        r = do_click_xy(page, pos[0], pos[1])
+        if r[0] is not None:
+            _last_wicket_time = time.time()
+            ms = round((time.perf_counter() - t0) * 1000)
+            log(f"[CLICK-SCAN] UNDER @({pos[0]:.0f},{pos[1]:.0f}) "
+                f"rel={UNDER_REL_POS} [+{ms}ms]")
+            return True
+
+    # ---------- FALLBACK: configured UNDER box ----------
     under_box = next((t for t in MAPPED_TARGETS if t["side"] == "under"), None)
     if under_box:
-        cx, cy = do_click_box(page, under_box, ax, ay)
-        if cx is None:
-            return False
-        _last_wicket_time = time.time()   # FIX #6: only on success
-        ms = round((time.perf_counter() - t0) * 1000)
-        log(f"[FALLBACK] 'Under' text not found -> configured UNDER box "
-            f"@({cx:.0f},{cy:.0f}) [+{ms}ms]")
-        return True
+        r = do_click_box(page, under_box, ax, ay)
+        if r[0] is not None:
+            _last_wicket_time = time.time()
+            ms = round((time.perf_counter() - t0) * 1000)
+            log(f"[FALLBACK] configured UNDER box [+{ms}ms]")
+            return True
 
-    log("[FAIL] no Under box available")
+    log("[FAIL] no Under available")
     return False
 
 
+# ============================================================
+#  Ball classification
+# ============================================================
 def ball_info(d):
     ev = str(d.get("ev") or "").strip()
     ev_low = ev.lower()
@@ -451,7 +504,7 @@ def ball_info(d):
 
 
 # ============================================================
-#  WebSocket client
+#  WebSocket
 # ============================================================
 async def ws_loop():
     while not _stop_event.is_set():
@@ -490,21 +543,18 @@ async def ws_loop():
                             m = json.loads(raw)
                         except (ValueError, TypeError):
                             continue
-
                         mid_msg = m.get("id")
                         if mf and mid_msg and str(mid_msg) != str(mf):
                             continue
-
                         if m.get("t") == "reset":
                             handle_reset(m.get("from"), m.get("to"))
                             continue
-
                         WS_STATE["msg_count"] += 1
                         WS_STATE["last_ts"] = time.time()
                         try:
                             event_q.put_nowait(m)
                         except queue.Full:
-                            dbg("event_q full - dropping message")
+                            dbg("event_q full - dropping")
                 finally:
                     ptask.cancel()
         except asyncio.CancelledError:
@@ -524,7 +574,6 @@ def start_ws_thread():
             asyncio.run(ws_loop())
         except Exception as e:
             log(f"[WS] thread crashed: {e}")
-
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -538,8 +587,6 @@ def monitor_and_click():
         print("Usage: python clicker.py <match_key> [multi]")
         return
     match_filter = sys.argv[1].strip()
-
-    # FIX #2: accept "multi" arg (same behavior, just logged)
     mode = "single"
     if len(sys.argv) >= 3:
         arg2 = sys.argv[2].strip().lower()
@@ -567,7 +614,8 @@ def monitor_and_click():
     if proxy_url:
         try:
             if "@" in proxy_url:
-                proto, rest = proxy_url.split("://") if "://" in proxy_url else ("http://", proxy_url)
+                proto, rest = (proxy_url.split("://") if "://" in proxy_url
+                               else ("http://", proxy_url))
                 auth, host_port = rest.split("@")
                 user, pwd = auth.split(":")
                 proxy_config = {"server": f"{proto}://{host_port}",
@@ -614,11 +662,10 @@ def monitor_and_click():
 
         print("\n" + "=" * 65)
         print("Go to browser and select 'Next Wicket Fall' market")
-        print("Adjust red boxes: TOP box over Over, BOTTOM box over Under")
+        print("Adjust red boxes: TOP = Over, BOTTOM = Under")
         print("Click 'DONE' when ready")
         print("=" * 65 + "\n")
 
-        # FIX #7: crash-proof calibration
         while not _stop_event.is_set():
             try:
                 page.evaluate("() => { window.__pw_action = null; }")
@@ -650,12 +697,19 @@ def monitor_and_click():
             browser.close()
             return
 
+        # ===== ★ PREWARM: cache Under position now, so first wicket is instant
+        log("[PREWARM] scanning for 'Under' button...")
+        prewarm_under_position(page, retries=3)
+
         start_ws_thread()
         log(f"[WS] waiting... (match_key={match_filter}, mode={mode})")
-        log("   v26 - dynamic 'Under' finder, one click per wicket")
-        log(f"   Template threshold: {TEMPLATE_MATCH_THRESHOLD}")
-        log(f"   OCR upscale: {OCR_UPSCALE}x")
-        log(f"   Wicket throttle: {WICKET_THROTTLE_S}s (on success only)\n")
+        log(f"   v27 - FAST wicket click  (target 5-10ms)")
+        if UNDER_REL_POS is not None:
+            log(f"   Under prewarmed rel={UNDER_REL_POS} → first wicket INSTANT")
+        else:
+            log(f"   Under NOT prewarmed → first wicket will scan (~300ms)")
+        log(f"   Throttle={WICKET_THROTTLE_S}s  Verify every {VERIFY_EVERY} clicks")
+        log(f"   Event Q={EVENT_Q_MAXSIZE}  Anchor trust={ANCHOR_TRUST_SEC}s\n")
 
         _last_dedup_key = None
 
@@ -672,14 +726,20 @@ def monitor_and_click():
                     continue
 
                 ev = str(m.get("ev") or "").strip()
-                if not ev or is_ball_chalu(ev) or is_intermediate(ev):
+                if not ev:
+                    continue
+
+                if is_ball_chalu(ev):
+                    _last_dedup_key = None
+                    continue
+
+                if is_intermediate(ev):
                     continue
 
                 text, kind, _ = ball_info(m)
                 if kind != "wicket":
                     continue
 
-                # FIX #3+#4: dedup includes ball/xball; over=0 handled
                 over_str = str(m.get("over", ""))
                 bkey = m.get("xball") or m.get("ball") or ""
                 dedup_key = f"{over_str}|{bkey}|{text}"
