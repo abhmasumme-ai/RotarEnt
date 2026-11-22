@@ -1,5 +1,5 @@
 """
-clicker.py - v18 (v17 + post-click pre-warm + multi fast-dedup + fast constants)
+clicker.py - v18 (v17 + post-click pre-warm + multi fast-dedup + fast constants) clickerdualmode delivery over/under
 ================================================================================
 Modes:
   - Single-exact (default):
