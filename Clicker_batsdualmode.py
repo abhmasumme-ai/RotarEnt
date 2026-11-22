@@ -1,5 +1,5 @@
 """
-clicker.py - v25 (wicket-only, PREDICTIVE ROSTER + dual-mode match)
+clicker.py - v25 (wicket-only, PREDICTIVE ROSTER + dual-mode match) ==== batsmandualmode
 ====================================================================
 NEW in v25 (vs v24):
   ★ PanelRoster : cache name -> row mapping during match watching
